@@ -1,0 +1,40 @@
+[package]
+name = "k3-kv"
+description = "Context memory holder daemon and shared memory arena management for the SpacemiT K3 AI platform"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "AGPL-3.0-only"
+repository = "https://github.com/LMA1980/k3-kv"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"
+
+[lib]
+name = "k3_kv"
+path = "src/lib.rs"
+
+[[bin]]
+name = "k3-kv"
+path = "src/main.rs"
+
+[dependencies]
+k3-core = { workspace = true }
+libc = { workspace = true }
+tokio = { workspace = true }
+fory = { workspace = true }
+fory-derive = { workspace = true }
+zerocopy = { workspace = true }
+arrow-buffer = { workspace = true }
+arrow-array = { workspace = true }
+sendfd = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
