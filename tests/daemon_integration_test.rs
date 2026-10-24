@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use k3_core::ipc::layout::{ARENA_MAGIC, ARENA_VERSION, TAG_PERSIST};
 use k3_core::ipc::protocol::{
-    recv_msg_frame, send_msg_frame, AllocateArenaRequest, DeallocateArenaRequest, GetArenaFdRequest,
-    IpcMessage, PingRequest, PingResponse, StatusCode,
+    AllocateArenaRequest, DeallocateArenaRequest, GetArenaFdRequest, IpcMessage, PingRequest,
+    PingResponse, StatusCode, recv_msg_frame, send_msg_frame,
 };
 use k3_core::ipc::shm::SharedMemoryArena;
 
@@ -112,7 +112,10 @@ fn test_cli_invalid_arguments_return_exit_code_2() {
     assert!(String::from_utf8_lossy(&out1.stderr).contains("unknown option"));
 
     // Case 2: Missing argument to --socket
-    let out2 = Command::new(bin).arg("--socket").output().expect("run binary");
+    let out2 = Command::new(bin)
+        .arg("--socket")
+        .output()
+        .expect("run binary");
     assert_eq!(out2.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out2.stderr).contains("--socket requires a file path"));
 
@@ -123,7 +126,9 @@ fn test_cli_invalid_arguments_return_exit_code_2() {
         .output()
         .expect("run binary");
     assert_eq!(out3.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out3.stderr).contains("--socket requires a non-empty file path"));
+    assert!(
+        String::from_utf8_lossy(&out3.stderr).contains("--socket requires a non-empty file path")
+    );
 
     // Case 4: Non-numeric --max-memory-bytes
     let out4 = Command::new(bin)
@@ -151,7 +156,10 @@ fn test_cli_help_and_version_return_exit_code_0() {
     assert_eq!(out_help.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&out_help.stdout).contains("USAGE:"));
 
-    let out_ver = Command::new(bin).arg("--version").output().expect("run version");
+    let out_ver = Command::new(bin)
+        .arg("--version")
+        .output()
+        .expect("run version");
     assert_eq!(out_ver.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&out_ver.stdout).contains("k3-kv"));
 }
@@ -231,13 +239,9 @@ fn test_daemon_arena_allocation_scm_rights_reception_and_mutation() {
     let raw_fd = opt_fd.expect("expected SCM_RIGHTS FD passed with response");
 
     // 3. Map arena in client address space
-    let mut client_arena = SharedMemoryArena::from_existing_fd(
-        raw_fd,
-        32 * 1024 * 1024,
-        "qwen2.5-7b-instruct",
-        false,
-    )
-    .expect("map existing shm fd in client");
+    let mut client_arena =
+        SharedMemoryArena::from_existing_fd(raw_fd, 32 * 1024 * 1024, "qwen2.5-7b-instruct", false)
+            .expect("map existing shm fd in client");
 
     // Verify ArenaHeader initialized by KvHolder
     {
@@ -250,7 +254,9 @@ fn test_daemon_arena_allocation_scm_rights_reception_and_mutation() {
 
     // 4. Mutate shared memory arena in-place
     {
-        let meta = client_arena.block_meta_mut(0).expect("get mutable block meta 0");
+        let meta = client_arena
+            .block_meta_mut(0)
+            .expect("get mutable block meta 0");
         meta.block_id = 101;
         meta.tag = TAG_PERSIST;
         meta.committed_token_count = 16;
@@ -278,7 +284,9 @@ fn test_daemon_arena_allocation_scm_rights_reception_and_mutation() {
 
     // Verify client 2 observes in-place mutations without copying
     {
-        let meta2 = second_client_arena.block_meta(0).expect("read block meta 0 from client 2");
+        let meta2 = second_client_arena
+            .block_meta(0)
+            .expect("read block meta 0 from client 2");
         assert_eq!(meta2.block_id, 101);
         assert_eq!(meta2.tag, TAG_PERSIST);
         assert_eq!(meta2.committed_token_count, 16);
@@ -354,7 +362,10 @@ fn test_daemon_memlock_ceiling_rejection() {
     let ping = IpcMessage::PingRequest(PingRequest { timestamp_ns: 42 });
     send_msg_frame(&stream, &ping, None).expect("send ping");
     let (ping_resp, _) = recv_msg_frame(&stream).expect("recv ping");
-    assert_eq!(ping_resp, IpcMessage::PingResponse(PingResponse { timestamp_ns: 42 }));
+    assert_eq!(
+        ping_resp,
+        IpcMessage::PingResponse(PingResponse { timestamp_ns: 42 })
+    );
 
     drop(stream);
 

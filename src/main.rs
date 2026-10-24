@@ -180,7 +180,8 @@ async fn main() -> ExitCode {
     }
 
     // Register OS termination signal handlers
-    let mut sigint = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+    let mut sigint = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+    {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[error] failed to register SIGINT handler: {e}");
@@ -188,7 +189,8 @@ async fn main() -> ExitCode {
         }
     };
 
-    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[error] failed to register SIGTERM handler: {e}");
@@ -218,7 +220,10 @@ async fn main() -> ExitCode {
     if let Some(parent) = config.socket_path.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
             if let Err(e) = fs::create_dir_all(parent) {
-                eprintln!("[error] failed to create socket parent dir {}: {e}", parent.display());
+                eprintln!(
+                    "[error] failed to create socket parent dir {}: {e}",
+                    parent.display()
+                );
                 return ExitCode::from(1);
             }
         }
@@ -240,15 +245,10 @@ async fn main() -> ExitCode {
 
     let shutdown_handle = server.shutdown_handle();
     let server_task_server = Arc::clone(&server);
-    let server_task = tokio::spawn(async move {
-        server_task_server.run().await
-    });
+    let server_task = tokio::spawn(async move { server_task_server.run().await });
 
     if config.verbose {
-        eprintln!(
-            "[k3-kv] listener ready on {}",
-            config.socket_path.display()
-        );
+        eprintln!("[k3-kv] listener ready on {}", config.socket_path.display());
     }
 
     // Await server completion or OS termination signal

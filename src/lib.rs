@@ -6,12 +6,12 @@ pub mod holder;
 pub mod server;
 
 pub use holder::{
-    compute_arena_layout, ArenaAllocationConfig, ArenaAllocationResult, ComputedArenaLayout,
-    KvError, KvHolder,
+    ArenaAllocationConfig, ArenaAllocationResult, ComputedArenaLayout, KvError, KvHolder,
+    compute_arena_layout,
 };
 pub use server::{
-    handle_connection, prepare_and_bind_socket, KvServer, ServerConfig, SocketFileGuard,
-    DEFAULT_SOCKET_PATH,
+    DEFAULT_SOCKET_PATH, KvServer, ServerConfig, SocketFileGuard, handle_connection,
+    prepare_and_bind_socket,
 };
 
 #[cfg(test)]

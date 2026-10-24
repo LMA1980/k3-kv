@@ -20,17 +20,17 @@
 )]
 
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use k3_core::ipc::layout::{
-    ArenaHeader, KvBlockMeta, OutputSlabHeader, TokenInputSlotHeader, ARENA_MAGIC, ARENA_VERSION,
-    CACHELINE_ALIGNMENT, TAG_FREE, TAG_PERSIST,
+    ARENA_MAGIC, ARENA_VERSION, ArenaHeader, CACHELINE_ALIGNMENT, KvBlockMeta, OutputSlabHeader,
+    TAG_FREE, TAG_PERSIST, TokenInputSlotHeader,
 };
 use k3_core::ipc::protocol::StatusCode;
 use k3_core::ipc::shm::system_page_size;
-use k3_kv::holder::{compute_arena_layout, ArenaAllocationConfig, KvError, KvHolder};
+use k3_kv::holder::{ArenaAllocationConfig, KvError, KvHolder, compute_arena_layout};
 
 /// Helper to count currently open file descriptors for leak verification.
 fn count_open_fds() -> usize {
@@ -77,11 +77,13 @@ fn test_challenge_memlock_exact_ceiling_succeeds() {
     // Subsequent allocation (even with 0 requested bytes or 1 block) MUST fail
     let res2 = holder.allocate(&config);
     match res2 {
-        Err(err @ KvError::InsufficientLockableMemory {
-            required_bytes,
-            allocated_bytes,
-            memlock_ceiling_bytes,
-        }) => {
+        Err(
+            err @ KvError::InsufficientLockableMemory {
+                required_bytes,
+                allocated_bytes,
+                memlock_ceiling_bytes,
+            },
+        ) => {
             assert_eq!(required_bytes, exact_ceiling);
             assert_eq!(allocated_bytes, exact_ceiling);
             assert_eq!(memlock_ceiling_bytes, exact_ceiling);
@@ -108,11 +110,13 @@ fn test_challenge_memlock_ceiling_minus_one_byte_rejects() {
 
     let res = holder.allocate(&config);
     match res {
-        Err(err @ KvError::InsufficientLockableMemory {
-            required_bytes: req,
-            allocated_bytes: alloc,
-            memlock_ceiling_bytes: ceil,
-        }) => {
+        Err(
+            err @ KvError::InsufficientLockableMemory {
+                required_bytes: req,
+                allocated_bytes: alloc,
+                memlock_ceiling_bytes: ceil,
+            },
+        ) => {
             assert_eq!(req, required_bytes);
             assert_eq!(alloc, 0);
             assert_eq!(ceil, tight_ceiling);
@@ -195,11 +199,13 @@ fn test_challenge_memlock_multiple_arena_cumulative_overflow() {
     // 5th allocation MUST fail with exit code 11
     let overflow_res = holder.allocate(&config);
     match overflow_res {
-        Err(err @ KvError::InsufficientLockableMemory {
-            required_bytes,
-            allocated_bytes,
-            memlock_ceiling_bytes,
-        }) => {
+        Err(
+            err @ KvError::InsufficientLockableMemory {
+                required_bytes,
+                allocated_bytes,
+                memlock_ceiling_bytes,
+            },
+        ) => {
             assert_eq!(required_bytes, single_bytes);
             assert_eq!(allocated_bytes, exact_4_ceiling);
             assert_eq!(memlock_ceiling_bytes, exact_4_ceiling);
@@ -355,7 +361,9 @@ fn test_challenge_arena_memory_layout_alignment_and_no_overlap_exhaustive() {
                             .with_active_slots(active_slots);
 
                             let layout = compute_arena_layout(&config).unwrap_or_else(|e| {
-                                panic!("layout failed for n_ctx={n_ctx}, head_dim={head_dim}: {e:?}")
+                                panic!(
+                                    "layout failed for n_ctx={n_ctx}, head_dim={head_dim}: {e:?}"
+                                )
                             });
 
                             // 1. Strict 64-byte alignment check on all offsets
@@ -396,8 +404,8 @@ fn test_challenge_arena_memory_layout_alignment_and_no_overlap_exhaustive() {
 
                             // Region 1: KvBlockMeta table
                             let meta_start = layout.meta_table_offset;
-                            let meta_bytes = u64::from(layout.block_count)
-                                * size_of::<KvBlockMeta>() as u64;
+                            let meta_bytes =
+                                u64::from(layout.block_count) * size_of::<KvBlockMeta>() as u64;
                             let meta_end = meta_start + meta_bytes;
 
                             // Region 2: TokenInputSlots
@@ -416,8 +424,7 @@ fn test_challenge_arena_memory_layout_alignment_and_no_overlap_exhaustive() {
                                 * u64::from(head_count_kv)
                                 * u64::from(head_dim)
                                 * 4;
-                            let kv_bytes =
-                                u64::from(layout.block_count) * 16 * bytes_per_token;
+                            let kv_bytes = u64::from(layout.block_count) * 16 * bytes_per_token;
                             let kv_end = kv_start + kv_bytes;
 
                             // Region 4: OutputSlabs
@@ -641,10 +648,12 @@ fn test_challenge_concurrent_multithreaded_stress_and_memlock_accounting() {
 
 #[test]
 fn test_challenge_daemon_sigterm_graceful_shutdown_with_connected_client() {
+    use k3_core::ipc::protocol::{
+        IpcMessage, PingRequest, PingResponse, recv_msg_frame, send_msg_frame,
+    };
     use std::os::unix::net::UnixStream;
     use std::process::Command;
     use std::time::{Duration, Instant};
-    use k3_core::ipc::protocol::{recv_msg_frame, send_msg_frame, IpcMessage, PingRequest, PingResponse};
 
     let socket_path = std::env::temp_dir().join(format!("k3_kv_probe_{}.sock", std::process::id()));
     if socket_path.exists() {
@@ -675,10 +684,17 @@ fn test_challenge_daemon_sigterm_graceful_shutdown_with_connected_client() {
 
     // Connect client and send ping
     let stream = UnixStream::connect(&socket_path).expect("connect client");
-    let ping = IpcMessage::PingRequest(PingRequest { timestamp_ns: 12345 });
+    let ping = IpcMessage::PingRequest(PingRequest {
+        timestamp_ns: 12345,
+    });
     send_msg_frame(&stream, &ping, None).expect("send ping");
     let (resp, _) = recv_msg_frame(&stream).expect("recv ping response");
-    assert_eq!(resp, IpcMessage::PingResponse(PingResponse { timestamp_ns: 12345 }));
+    assert_eq!(
+        resp,
+        IpcMessage::PingResponse(PingResponse {
+            timestamp_ns: 12345
+        })
+    );
 
     // IMPORTANT: Keep `stream` OPEN (do NOT drop it) to simulate active connected client!
     // Now send SIGTERM to daemon process
