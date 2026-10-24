@@ -27,14 +27,14 @@ name = "k3-kv"
 path = "src/main.rs"
 
 [dependencies]
-k3-core = { workspace = true }
-libc = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
-fory = { workspace = true }
-fory-derive = { workspace = true }
-zerocopy = { workspace = true }
-arrow-buffer = { workspace = true }
-arrow-array = { workspace = true }
-sendfd = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
+k3-core = { version = "0.1.0", git = "https://github.com/LMA1980/k3-core.git" }
+arrow-array = "59.3.1"
+arrow-buffer = "59.3.1"
+fory = "1.7.7"
+fory-derive = "1.7.7"
+libc = "0.2"
+sendfd = "0.4.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "time", "net", "io-util", "sync", "macros", "signal"] }
+zerocopy = { version = "0.8.63", features = ["derive"] }
