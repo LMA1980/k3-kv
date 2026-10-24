@@ -8,6 +8,7 @@ use std::fs;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use k3_core::ipc::shm::DEFAULT_LIMIT_MEMLOCK_BYTES;
 use k3_kv::holder::KvHolder;
@@ -223,11 +224,11 @@ async fn main() -> ExitCode {
         }
     }
 
-    let _socket_guard = SocketFileGuard::new(config.socket_path.clone());
+    let socket_guard = SocketFileGuard::new(config.socket_path.clone());
 
     let holder = KvHolder::with_memlock_ceiling(config.max_memory_bytes);
     let server = match KvServer::bind(&config.socket_path, holder) {
-        Ok(s) => s,
+        Ok(s) => Arc::new(s),
         Err(e) => {
             eprintln!(
                 "[error] failed to bind socket {}: {e}",
@@ -238,8 +239,9 @@ async fn main() -> ExitCode {
     };
 
     let shutdown_handle = server.shutdown_handle();
+    let server_task_server = Arc::clone(&server);
     let server_task = tokio::spawn(async move {
-        server.run().await
+        server_task_server.run().await
     });
 
     if config.verbose {
@@ -255,6 +257,7 @@ async fn main() -> ExitCode {
             if config.verbose {
                 eprintln!("[k3-kv] received SIGINT (Ctrl+C), initiating graceful shutdown...");
             }
+            server.shutdown();
             shutdown_handle.notify_waiters();
             shutdown_handle.notify_one();
         }
@@ -262,6 +265,7 @@ async fn main() -> ExitCode {
             if config.verbose {
                 eprintln!("[k3-kv] received SIGTERM, initiating graceful shutdown...");
             }
+            server.shutdown();
             shutdown_handle.notify_waiters();
             shutdown_handle.notify_one();
         }
@@ -277,7 +281,6 @@ async fn main() -> ExitCode {
                     return ExitCode::from(1);
                 }
             }
-            return ExitCode::SUCCESS;
         }
     }
 
@@ -285,5 +288,10 @@ async fn main() -> ExitCode {
         eprintln!("[k3-kv] shutdown completed, unlinking socket");
     }
 
-    ExitCode::SUCCESS
+    drop(socket_guard);
+    if config.socket_path.exists() {
+        let _ = fs::remove_file(&config.socket_path);
+    }
+
+    std::process::exit(0);
 }

@@ -7,8 +7,9 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use k3_core::ipc::protocol::{
     global_fory, recv_frame, send_msg_frame, AllocateArenaRequest, AllocateArenaResponse,
@@ -121,6 +122,8 @@ pub struct KvServer {
     holder: Arc<KvHolder>,
     shutdown_notify: Arc<tokio::sync::Notify>,
     is_shutdown: Arc<AtomicBool>,
+    active_clients: Arc<Mutex<HashMap<u64, UnixStream>>>,
+    next_client_id: Arc<AtomicU64>,
 }
 
 impl KvServer {
@@ -139,6 +142,8 @@ impl KvServer {
             holder,
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             is_shutdown: Arc::new(AtomicBool::new(false)),
+            active_clients: Arc::new(Mutex::new(HashMap::new())),
+            next_client_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -176,11 +181,25 @@ impl KvServer {
         Arc::clone(&self.shutdown_notify)
     }
 
-    /// Triggers graceful server shutdown.
+    /// Returns the number of currently active client connections.
+    #[must_use]
+    pub fn active_client_count(&self) -> usize {
+        self.active_clients
+            .lock()
+            .map_or(0, |c| c.len())
+    }
+
+    /// Triggers graceful server shutdown, stopping the accept loop and terminating active client streams.
     pub fn shutdown(&self) {
         self.is_shutdown.store(true, Ordering::SeqCst);
         self.shutdown_notify.notify_waiters();
         self.shutdown_notify.notify_one();
+        if let Ok(mut clients) = self.active_clients.lock() {
+            for stream in clients.values() {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+            clients.clear();
+        }
     }
 
     /// Runs the server accept loop until shutdown notification is received.
@@ -196,6 +215,9 @@ impl KvServer {
                 accept_res = listener.accept() => {
                     match accept_res {
                         Ok((stream, _addr)) => {
+                            if self.is_shutdown.load(Ordering::SeqCst) {
+                                break;
+                            }
                             let holder = Arc::clone(&self.holder);
                             match stream.into_std() {
                                 Ok(std_stream) => {
@@ -203,7 +225,37 @@ impl KvServer {
                                         eprintln!("[k3-kv] Failed to set stream blocking mode: {e}");
                                         continue;
                                     }
+
+                                    let client_id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
+                                    let active_clients = Arc::clone(&self.active_clients);
+
+                                    // Track connection for shutdown signaling
+                                    if let Ok(cloned) = std_stream.try_clone() {
+                                        if let Ok(mut clients) = active_clients.lock() {
+                                            if self.is_shutdown.load(Ordering::SeqCst) {
+                                                let _ = cloned.shutdown(std::net::Shutdown::Both);
+                                                break;
+                                            }
+                                            clients.insert(client_id, cloned);
+                                        }
+                                    }
+
                                     tokio::task::spawn_blocking(move || {
+                                        struct ClientGuard {
+                                            id: u64,
+                                            clients: Arc<Mutex<HashMap<u64, UnixStream>>>,
+                                        }
+                                        impl Drop for ClientGuard {
+                                            fn drop(&mut self) {
+                                                if let Ok(mut map) = self.clients.lock() {
+                                                    map.remove(&self.id);
+                                                }
+                                            }
+                                        }
+                                        let _guard = ClientGuard {
+                                            id: client_id,
+                                            clients: active_clients,
+                                        };
                                         let _ = handle_connection(&std_stream, &holder);
                                     });
                                 }
@@ -223,6 +275,8 @@ impl KvServer {
             }
         }
 
+        // Cleanly terminate active client connections so blocking worker threads unblock immediately
+        self.shutdown();
         Ok(())
     }
 }
@@ -736,6 +790,71 @@ mod tests {
 
         server.shutdown();
         handle.await.unwrap();
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_server_shutdown_unblocks_connected_client_task() {
+        use std::io::Read;
+
+        let tmp_dir = std::env::temp_dir().join(format!("k3_kv_unblock_{}", std::process::id()));
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let sock_path = tmp_dir.join("k3-kv.sock");
+
+        let config = ServerConfig {
+            socket_path: sock_path.clone(),
+            max_memory_bytes: 1024 * 1024 * 1024,
+        };
+        let server = Arc::new(KvServer::new(config));
+        let server_clone = Arc::clone(&server);
+
+        let handle = tokio::spawn(async move {
+            server_clone.run().await.unwrap();
+        });
+
+        // Wait until server is accepting
+        let mut client_opt = None;
+        for _ in 0..50 {
+            if sock_path.exists() {
+                if let Ok(client) = UnixStream::connect(&sock_path) {
+                    client_opt = Some(client);
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let client = client_opt.expect("client must connect");
+
+        // Send a ping to verify connection is active and handled by worker thread
+        let ping = IpcMessage::PingRequest(PingRequest { timestamp_ns: 777 });
+        send_msg_frame(&client, &ping, None).unwrap();
+        let (resp, _) = recv_msg_frame(&client).unwrap();
+        assert_eq!(resp, IpcMessage::PingResponse(PingResponse { timestamp_ns: 777 }));
+
+        assert_eq!(server.active_client_count(), 1);
+
+        // Keep client open and call server.shutdown()
+        server.shutdown();
+
+        // Server run() loop and blocking tasks must terminate promptly without hanging
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("server handle must exit within 2s on shutdown")
+            .unwrap();
+
+        // Reading from client should now report EOF or error because server shut it down
+        let mut buf = [0u8; 16];
+        let mut client_ref = &client;
+        let read_res = client_ref.read(&mut buf);
+        match read_res {
+            Ok(0) => {} // EOF
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
+            Err(e) if e.kind() == io::ErrorKind::NotConnected => {}
+            other => panic!("Expected EOF or connection error, got {other:?}"),
+        }
+
+        drop(client);
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 }
