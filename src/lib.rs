@@ -2,6 +2,18 @@
 
 pub const KV_DAEMON_NAME: &str = "k3-kv";
 
+pub mod holder;
+pub mod server;
+
+pub use holder::{
+    compute_arena_layout, ArenaAllocationConfig, ArenaAllocationResult, ComputedArenaLayout,
+    KvError, KvHolder,
+};
+pub use server::{
+    handle_connection, prepare_and_bind_socket, KvServer, ServerConfig, SocketFileGuard,
+    DEFAULT_SOCKET_PATH,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
