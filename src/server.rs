@@ -1,5 +1,6 @@
 //! Unix Domain Socket server and message dispatch loop for `k3-kv`.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::os::fd::AsRawFd;
@@ -7,14 +8,13 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use k3_core::ipc::protocol::{
-    global_fory, recv_frame, send_msg_frame, AllocateArenaRequest, AllocateArenaResponse,
-    DeallocateArenaRequest, DeallocateArenaResponse, GetArenaFdRequest, GetArenaFdResponse,
-    IpcMessage, PingRequest, PingResponse, StatusCode,
+    AllocateArenaRequest, AllocateArenaResponse, DeallocateArenaRequest, DeallocateArenaResponse,
+    GetArenaFdRequest, GetArenaFdResponse, IpcMessage, PingRequest, PingResponse, StatusCode,
+    global_fory, recv_frame, send_msg_frame,
 };
 use k3_core::ipc::shm::DEFAULT_LIMIT_MEMLOCK_BYTES;
 
@@ -86,7 +86,10 @@ pub fn prepare_and_bind_socket(socket_path: &Path) -> io::Result<tokio::net::Uni
             Ok(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::AddrInUse,
-                    format!("Another k3-kv daemon is actively listening on {}", socket_path.display()),
+                    format!(
+                        "Another k3-kv daemon is actively listening on {}",
+                        socket_path.display()
+                    ),
                 ));
             }
             Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
@@ -184,9 +187,7 @@ impl KvServer {
     /// Returns the number of currently active client connections.
     #[must_use]
     pub fn active_client_count(&self) -> usize {
-        self.active_clients
-            .lock()
-            .map_or(0, |c| c.len())
+        self.active_clients.lock().map_or(0, |c| c.len())
     }
 
     /// Triggers graceful server shutdown, stopping the accept loop and terminating active client streams.
@@ -294,10 +295,7 @@ pub enum DispatchError {
 ///
 /// # Errors
 /// Returns [`io::Error`] on fatal I/O failure.
-pub fn handle_connection(
-    stream: &UnixStream,
-    holder: &Arc<KvHolder>,
-) -> io::Result<()> {
+pub fn handle_connection(stream: &UnixStream, holder: &Arc<KvHolder>) -> io::Result<()> {
     let fory = global_fory();
 
     loop {
@@ -363,7 +361,12 @@ pub fn dispatch_single_request(
                 DispatchError::ProtocolError(format!("Corrupt AllocateArenaRequest: {e}"))
             })?;
 
-            let resp = match holder.allocate_arena(&req.model_id, req.arena_bytes, req.n_ctx, req.max_blocks) {
+            let resp = match holder.allocate_arena(
+                &req.model_id,
+                req.arena_bytes,
+                req.n_ctx,
+                req.max_blocks,
+            ) {
                 Ok(res) => AllocateArenaResponse {
                     arena_id: res.arena_id,
                     arena_bytes: res.total_bytes,
@@ -429,9 +432,9 @@ pub fn dispatch_single_request(
 
         // 4. PingRequest (Type ID: 107)
         107 => {
-            let req: PingRequest = fory.deserialize(payload).map_err(|e| {
-                DispatchError::ProtocolError(format!("Corrupt PingRequest: {e}"))
-            })?;
+            let req: PingRequest = fory
+                .deserialize(payload)
+                .map_err(|e| DispatchError::ProtocolError(format!("Corrupt PingRequest: {e}")))?;
 
             let resp = PingResponse {
                 timestamp_ns: req.timestamp_ns,
@@ -473,10 +476,17 @@ mod tests {
         });
 
         // 1. Ping
-        let ping = IpcMessage::PingRequest(PingRequest { timestamp_ns: 42_000_000 });
+        let ping = IpcMessage::PingRequest(PingRequest {
+            timestamp_ns: 42_000_000,
+        });
         send_msg_frame(&client_stream, &ping, None).unwrap();
         let (resp, _) = recv_msg_frame(&client_stream).unwrap();
-        assert_eq!(resp, IpcMessage::PingResponse(PingResponse { timestamp_ns: 42_000_000 }));
+        assert_eq!(
+            resp,
+            IpcMessage::PingResponse(PingResponse {
+                timestamp_ns: 42_000_000
+            })
+        );
 
         // 2. AllocateArena
         let alloc = IpcMessage::AllocateArenaRequest(AllocateArenaRequest {
@@ -548,7 +558,9 @@ mod tests {
         send_msg_frame(&client_stream, &alloc, None).unwrap();
         let (resp_alloc, _) = recv_msg_frame(&client_stream).unwrap();
         let (arena_id, allocated_len) = match resp_alloc {
-            IpcMessage::AllocateArenaResponse(r) => (r.arena_id, usize::try_from(r.arena_bytes).unwrap()),
+            IpcMessage::AllocateArenaResponse(r) => {
+                (r.arena_id, usize::try_from(r.arena_bytes).unwrap())
+            }
             other => panic!("unexpected: {other:?}"),
         };
 
@@ -563,7 +575,8 @@ mod tests {
             allocated_len,
             "mutation-test",
             false,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Verify ArenaHeader signature
         let header = client_arena.header().unwrap();
@@ -582,7 +595,10 @@ mod tests {
         // Verify shared-memory zero-copy coherence: server sees client mutation immediately
         assert_eq!(server_meta.tag, TAG_PERSIST);
         assert_eq!(server_meta.committed_token_count, 16);
-        assert_eq!(server_meta.sampler_rng_state, [0x1234_5678_9ABC_DEF0, 0, 0, 0]);
+        assert_eq!(
+            server_meta.sampler_rng_state,
+            [0x1234_5678_9ABC_DEF0, 0, 0, 0]
+        );
 
         drop(client_stream);
         server_thread.join().unwrap();
@@ -638,14 +654,15 @@ mod tests {
         });
 
         // 1. Send compute worker command (ForwardPassCommand, Type ID: 202)
-        let worker_cmd = IpcMessage::ForwardPassCommand(k3_core::ipc::protocol::ForwardPassCommand {
-            request_id: 1,
-            sequence_id: 1,
-            token_offset: 0,
-            token_count: 1,
-            block_indices: vec![0],
-            is_prefill: false,
-        });
+        let worker_cmd =
+            IpcMessage::ForwardPassCommand(k3_core::ipc::protocol::ForwardPassCommand {
+                request_id: 1,
+                sequence_id: 1,
+                token_offset: 0,
+                token_count: 1,
+                block_indices: vec![0],
+                is_prefill: false,
+            });
         send_msg_frame(&client_stream, &worker_cmd, None).unwrap();
         let (resp1, _) = recv_msg_frame(&client_stream).unwrap();
         match resp1 {
@@ -657,7 +674,8 @@ mod tests {
 
         // 2. Send corrupted Fory payload with known Type ID 101
         let garbage_payload = b"TOTALLY_CORRUPTED_FORY_DATA";
-        k3_core::ipc::protocol::send_frame(client_stream.as_raw_fd(), 101, garbage_payload, None).unwrap();
+        k3_core::ipc::protocol::send_frame(client_stream.as_raw_fd(), 101, garbage_payload, None)
+            .unwrap();
         let (resp2, _) = recv_msg_frame(&client_stream).unwrap();
         match resp2 {
             IpcMessage::AllocateArenaResponse(r) => {
@@ -700,7 +718,10 @@ mod tests {
                         let ping = IpcMessage::PingRequest(PingRequest { timestamp_ns: 999 });
                         send_msg_frame(&client, &ping, None).unwrap();
                         let (resp, _) = recv_msg_frame(&client).unwrap();
-                        assert_eq!(resp, IpcMessage::PingResponse(PingResponse { timestamp_ns: 999 }));
+                        assert_eq!(
+                            resp,
+                            IpcMessage::PingResponse(PingResponse { timestamp_ns: 999 })
+                        );
                         drop(client);
                         return;
                     }
@@ -717,7 +738,10 @@ mod tests {
         handle.await.unwrap();
 
         // Verify socket file was unlinked by SocketFileGuard
-        assert!(!sock_path.exists(), "Socket file must be unlinked on shutdown");
+        assert!(
+            !sock_path.exists(),
+            "Socket file must be unlinked on shutdown"
+        );
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
@@ -773,11 +797,14 @@ mod tests {
                 let (_, opt_fd) = recv_msg_frame(&client).unwrap();
                 assert!(opt_fd.is_some());
 
-                let dealloc = IpcMessage::DeallocateArenaRequest(DeallocateArenaRequest { arena_id });
+                let dealloc =
+                    IpcMessage::DeallocateArenaRequest(DeallocateArenaRequest { arena_id });
                 send_msg_frame(&client, &dealloc, None).unwrap();
                 let (resp_d, _) = recv_msg_frame(&client).unwrap();
                 match resp_d {
-                    IpcMessage::DeallocateArenaResponse(r) => assert_eq!(r.status, StatusCode::Success),
+                    IpcMessage::DeallocateArenaResponse(r) => {
+                        assert_eq!(r.status, StatusCode::Success);
+                    }
                     _ => panic!(),
                 }
                 drop(client);
@@ -829,7 +856,10 @@ mod tests {
         let ping = IpcMessage::PingRequest(PingRequest { timestamp_ns: 777 });
         send_msg_frame(&client, &ping, None).unwrap();
         let (resp, _) = recv_msg_frame(&client).unwrap();
-        assert_eq!(resp, IpcMessage::PingResponse(PingResponse { timestamp_ns: 777 }));
+        assert_eq!(
+            resp,
+            IpcMessage::PingResponse(PingResponse { timestamp_ns: 777 })
+        );
 
         assert_eq!(server.active_client_count(), 1);
 

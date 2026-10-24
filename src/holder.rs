@@ -13,15 +13,15 @@ use std::sync::{Arc, RwLock};
 
 use zerocopy::FromBytes;
 
+use k3_core::K3Error;
 use k3_core::ipc::layout::{
-    ArenaHeader, KvBlockMeta, OutputSlabHeader, TokenInputSlotHeader, ARENA_MAGIC, ARENA_VERSION,
-    BLOCK_SIZE_TOKENS, CACHELINE_ALIGNMENT, SLAB_STATUS_IDLE, TAG_FREE,
+    ARENA_MAGIC, ARENA_VERSION, ArenaHeader, BLOCK_SIZE_TOKENS, CACHELINE_ALIGNMENT, KvBlockMeta,
+    OutputSlabHeader, SLAB_STATUS_IDLE, TAG_FREE, TokenInputSlotHeader,
 };
 use k3_core::ipc::protocol::{AllocateArenaRequest, StatusCode};
 use k3_core::ipc::shm::{
-    system_page_size, ArenaOptions, IpcError, SharedMemoryArena, DEFAULT_LIMIT_MEMLOCK_BYTES,
+    ArenaOptions, DEFAULT_LIMIT_MEMLOCK_BYTES, IpcError, SharedMemoryArena, system_page_size,
 };
-use k3_core::K3Error;
 
 /// Sizing and geometry parameters for allocating a shared memory arena.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,21 +161,13 @@ pub struct ComputedArenaLayout {
 /// Aligns a 64-bit unsigned integer up to the nearest multiple of `align`.
 const fn align_up_u64(val: u64, align: u64) -> u64 {
     let rem = val % align;
-    if rem == 0 {
-        val
-    } else {
-        val + (align - rem)
-    }
+    if rem == 0 { val } else { val + (align - rem) }
 }
 
 /// Aligns a `usize` value up to the nearest multiple of `align`.
 const fn align_up_usize(val: usize, align: usize) -> usize {
     let rem = val % align;
-    if rem == 0 {
-        val
-    } else {
-        val + (align - rem)
-    }
+    if rem == 0 { val } else { val + (align - rem) }
 }
 
 /// Computes the sub-region layout offsets and page-aligned total byte capacity
@@ -184,7 +176,9 @@ const fn align_up_usize(val: usize, align: usize) -> usize {
 /// # Errors
 /// Returns [`KvError::InvalidDimensions`] if any sizing parameter is zero or arithmetic overflows.
 #[allow(clippy::too_many_lines)]
-pub fn compute_arena_layout(config: &ArenaAllocationConfig) -> Result<ComputedArenaLayout, KvError> {
+pub fn compute_arena_layout(
+    config: &ArenaAllocationConfig,
+) -> Result<ComputedArenaLayout, KvError> {
     if config.n_ctx == 0 {
         return Err(KvError::InvalidDimensions(
             "n_ctx must be greater than zero".to_owned(),
@@ -252,11 +246,12 @@ pub fn compute_arena_layout(config: &ArenaAllocationConfig) -> Result<ComputedAr
     let block_bytes = u64::from(BLOCK_SIZE_TOKENS)
         .checked_mul(bytes_per_token)
         .ok_or_else(|| KvError::InvalidDimensions("block_bytes overflowed u64".to_owned()))?;
-    let total_kv_blocks_bytes = u64::from(block_count)
-        .checked_mul(block_bytes)
-        .ok_or_else(|| {
-            KvError::InvalidDimensions("total_kv_blocks_bytes overflowed u64".to_owned())
-        })?;
+    let total_kv_blocks_bytes =
+        u64::from(block_count)
+            .checked_mul(block_bytes)
+            .ok_or_else(|| {
+                KvError::InvalidDimensions("total_kv_blocks_bytes overflowed u64".to_owned())
+            })?;
     let kv_blocks_end = kv_blocks_offset
         .checked_add(total_kv_blocks_bytes)
         .ok_or_else(|| KvError::InvalidDimensions("kv_blocks_end overflowed u64".to_owned()))?;
@@ -270,9 +265,7 @@ pub fn compute_arena_layout(config: &ArenaAllocationConfig) -> Result<ComputedAr
     let aligned_slab_bytes = align_up_u64(per_slab_bytes, CACHELINE_ALIGNMENT as u64);
     let total_slabs_bytes = aligned_slab_bytes
         .checked_mul(u64::from(active_slots))
-        .ok_or_else(|| {
-            KvError::InvalidDimensions("total_slabs_bytes overflowed u64".to_owned())
-        })?;
+        .ok_or_else(|| KvError::InvalidDimensions("total_slabs_bytes overflowed u64".to_owned()))?;
     let output_slabs_end = output_slabs_offset
         .checked_add(total_slabs_bytes)
         .ok_or_else(|| KvError::InvalidDimensions("output_slabs_end overflowed u64".to_owned()))?;
@@ -432,9 +425,7 @@ impl KvHolder {
     /// Returns total bytes currently allocated and tracked across all active arenas.
     #[must_use]
     pub fn total_allocated_bytes(&self) -> u64 {
-        self.inner
-            .read()
-            .map_or(0, |g| g.allocated_bytes)
+        self.inner.read().map_or(0, |g| g.allocated_bytes)
     }
 
     /// Returns remaining lockable memory budget in bytes before reaching ceiling.
@@ -497,13 +488,13 @@ impl KvHolder {
                 .write()
                 .map_err(|e| KvError::LockError(e.to_string()))?;
             let current_allocated = guard.allocated_bytes;
-            let projected = current_allocated
-                .checked_add(layout.total_bytes)
-                .ok_or(KvError::InsufficientLockableMemory {
+            let projected = current_allocated.checked_add(layout.total_bytes).ok_or(
+                KvError::InsufficientLockableMemory {
                     required_bytes: layout.total_bytes,
                     allocated_bytes: current_allocated,
                     memlock_ceiling_bytes: self.memlock_ceiling_bytes,
-                })?;
+                },
+            )?;
 
             if projected > self.memlock_ceiling_bytes {
                 return Err(KvError::InsufficientLockableMemory {
@@ -533,9 +524,9 @@ impl KvHolder {
                 return match err {
                     IpcError::InsufficientLockableMemory(k3e) => {
                         let req = match k3e {
-                            K3Error::InsufficientLockableMemory {
-                                required_bytes, ..
-                            } => required_bytes,
+                            K3Error::InsufficientLockableMemory { required_bytes, .. } => {
+                                required_bytes
+                            }
                             _ => layout.total_bytes,
                         };
                         Err(KvError::InsufficientLockableMemory {
@@ -553,8 +544,7 @@ impl KvHolder {
         if let Err(init_err) = initialize_arena_contents(&mut arena, config, &layout) {
             // Rollback reservation
             if let Ok(mut guard) = self.inner.write() {
-                guard.allocated_bytes =
-                    guard.allocated_bytes.saturating_sub(layout.total_bytes);
+                guard.allocated_bytes = guard.allocated_bytes.saturating_sub(layout.total_bytes);
             }
             return Err(init_err);
         }
@@ -650,7 +640,9 @@ impl KvHolder {
         let arena = self
             .get_arena(arena_id)
             .ok_or(KvError::ArenaNotFound(arena_id))?;
-        arena.duplicate_fd().map_err(|e| KvError::IpcError(e.to_string()))
+        arena
+            .duplicate_fd()
+            .map_err(|e| KvError::IpcError(e.to_string()))
     }
 
     /// Deallocates all registered arenas and resets allocated byte accounting to 0.
@@ -702,9 +694,8 @@ fn initialize_arena_contents(
 
     // 2. Initialize KvBlockMeta table (0..block_count)
     for idx in 0..layout.block_count as usize {
-        let block_id = u32::try_from(idx).map_err(|_| {
-            KvError::InvalidDimensions("block index exceeds u32 range".to_owned())
-        })?;
+        let block_id = u32::try_from(idx)
+            .map_err(|_| KvError::InvalidDimensions("block index exceeds u32 range".to_owned()))?;
         let meta = arena.block_meta_mut(idx).map_err(|e| {
             KvError::IpcError(format!("failed to initialize block_meta[{idx}]: {e}"))
         })?;
@@ -722,7 +713,8 @@ fn initialize_arena_contents(
 
     // 3. Initialize TokenInputSlotHeader for active_slots
     let active_slots = config.active_slots.max(1) as usize;
-    let raw_slot_bytes = config.n_ctx as usize * size_of::<u32>() + size_of::<TokenInputSlotHeader>();
+    let raw_slot_bytes =
+        config.n_ctx as usize * size_of::<u32>() + size_of::<TokenInputSlotHeader>();
     let per_slot_bytes = align_up_usize(raw_slot_bytes, CACHELINE_ALIGNMENT);
     let token_slots_base = usize::try_from(layout.token_slots_offset).map_err(|_| {
         KvError::InvalidDimensions("token_slots_offset exceeds address space".to_owned())
@@ -732,10 +724,14 @@ fn initialize_arena_contents(
         let slot_slice = arena
             .slice_mut(slot_base, size_of::<TokenInputSlotHeader>())
             .map_err(|e| {
-                KvError::IpcError(format!("failed to slice token slot header[{slot_idx}]: {e}"))
+                KvError::IpcError(format!(
+                    "failed to slice token slot header[{slot_idx}]: {e}"
+                ))
             })?;
         let token_hdr = TokenInputSlotHeader::mut_from_bytes(slot_slice).map_err(|e| {
-            KvError::IpcError(format!("failed to decode TokenInputSlotHeader[{slot_idx}]: {e}"))
+            KvError::IpcError(format!(
+                "failed to decode TokenInputSlotHeader[{slot_idx}]: {e}"
+            ))
         })?;
         *token_hdr = TokenInputSlotHeader {
             slot_seq_id: 0,
@@ -756,10 +752,14 @@ fn initialize_arena_contents(
         let slab_slice = arena
             .slice_mut(slab_base, size_of::<OutputSlabHeader>())
             .map_err(|e| {
-                KvError::IpcError(format!("failed to slice output slab header[{slot_idx}]: {e}"))
+                KvError::IpcError(format!(
+                    "failed to slice output slab header[{slot_idx}]: {e}"
+                ))
             })?;
         let slab_hdr = OutputSlabHeader::mut_from_bytes(slab_slice).map_err(|e| {
-            KvError::IpcError(format!("failed to decode OutputSlabHeader[{slot_idx}]: {e}"))
+            KvError::IpcError(format!(
+                "failed to decode OutputSlabHeader[{slot_idx}]: {e}"
+            ))
         })?;
         *slab_hdr = OutputSlabHeader {
             request_id: 0,
@@ -832,11 +832,13 @@ mod tests {
         let res = holder.allocate(&config);
 
         match res {
-            Err(err @ KvError::InsufficientLockableMemory {
-                required_bytes,
-                allocated_bytes,
-                memlock_ceiling_bytes,
-            }) => {
+            Err(
+                err @ KvError::InsufficientLockableMemory {
+                    required_bytes,
+                    allocated_bytes,
+                    memlock_ceiling_bytes,
+                },
+            ) => {
                 assert!(required_bytes > small_ceiling);
                 assert_eq!(allocated_bytes, 0);
                 assert_eq!(memlock_ceiling_bytes, small_ceiling);
@@ -870,11 +872,13 @@ mod tests {
         let res2 = holder.allocate(&config2);
 
         match res2 {
-            Err(err @ KvError::InsufficientLockableMemory {
-                allocated_bytes,
-                memlock_ceiling_bytes,
-                ..
-            }) => {
+            Err(
+                err @ KvError::InsufficientLockableMemory {
+                    allocated_bytes,
+                    memlock_ceiling_bytes,
+                    ..
+                },
+            ) => {
                 assert_eq!(allocated_bytes, single_arena_bytes);
                 assert_eq!(memlock_ceiling_bytes, tight_ceiling);
                 assert_eq!(err.status_code(), StatusCode::InsufficientLockableMemory);
@@ -892,7 +896,9 @@ mod tests {
         assert_eq!(holder.total_allocated_bytes(), 0);
 
         // Now second allocation succeeds cleanly
-        let res3 = holder.allocate(&config2).expect("second allocation succeeds after freed");
+        let res3 = holder
+            .allocate(&config2)
+            .expect("second allocation succeeds after freed");
         assert_eq!(holder.total_allocated_bytes(), res3.total_bytes);
     }
 
@@ -911,7 +917,10 @@ mod tests {
 
         // Lookup non-existent
         assert!(holder.get_arena(9999).is_none());
-        assert_eq!(holder.get_arena_fd(9999).unwrap_err(), KvError::ArenaNotFound(9999));
+        assert_eq!(
+            holder.get_arena_fd(9999).unwrap_err(),
+            KvError::ArenaNotFound(9999)
+        );
         assert_eq!(
             holder.get_arena_fd(9999).unwrap_err().status_code(),
             StatusCode::ArenaNotFound

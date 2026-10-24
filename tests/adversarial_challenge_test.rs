@@ -15,9 +15,9 @@ use std::thread::{sleep, spawn};
 use std::time::{Duration, Instant};
 
 use k3_core::ipc::protocol::{
-    recv_msg_frame, send_frame, send_msg_frame, AllocateArenaRequest,
-    DeallocateArenaRequest, GetArenaFdRequest, IpcMessage, PingRequest, PingResponse, StatusCode,
-    FRAME_HEADER_LEN, FRAME_MAGIC, MAX_PAYLOAD_LEN,
+    AllocateArenaRequest, DeallocateArenaRequest, FRAME_HEADER_LEN, FRAME_MAGIC, GetArenaFdRequest,
+    IpcMessage, MAX_PAYLOAD_LEN, PingRequest, PingResponse, StatusCode, recv_msg_frame, send_frame,
+    send_msg_frame,
 };
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(100);
@@ -115,7 +115,9 @@ fn test_adversarial_corrupt_magic_numbers_rejection() {
     for &bad_magic in &corrupt_magics {
         eprintln!("[test] Testing bad magic 0x{bad_magic:08X}");
         let mut stream = UnixStream::connect(&socket).expect("connect to daemon");
-        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
 
         // Construct raw 12-byte header with bad magic
         let mut header = [0_u8; FRAME_HEADER_LEN];
@@ -147,10 +149,17 @@ fn test_adversarial_corrupt_magic_numbers_rejection() {
     // Verify daemon is still healthy and accepts valid ping
     eprintln!("[test] Verifying daemon health with valid ping");
     let stream = UnixStream::connect(&socket).expect("connect to daemon");
-    let ping = IpcMessage::PingRequest(PingRequest { timestamp_ns: 777_888 });
+    let ping = IpcMessage::PingRequest(PingRequest {
+        timestamp_ns: 777_888,
+    });
     send_msg_frame(&stream, &ping, None).expect("send valid ping");
     let (resp, _) = recv_msg_frame(&stream).expect("recv valid ping response");
-    assert_eq!(resp, IpcMessage::PingResponse(PingResponse { timestamp_ns: 777_888 }));
+    assert_eq!(
+        resp,
+        IpcMessage::PingResponse(PingResponse {
+            timestamp_ns: 777_888
+        })
+    );
     drop(stream);
 
     eprintln!("[test] Stopping daemon");
@@ -192,10 +201,17 @@ fn test_adversarial_oversized_payload_rejection() {
 
     // Verify daemon continues operating normally
     let stream = UnixStream::connect(&socket).expect("connect to daemon");
-    let ping = IpcMessage::PingRequest(PingRequest { timestamp_ns: 999_111 });
+    let ping = IpcMessage::PingRequest(PingRequest {
+        timestamp_ns: 999_111,
+    });
     send_msg_frame(&stream, &ping, None).expect("send valid ping");
     let (resp, _) = recv_msg_frame(&stream).expect("recv valid ping response");
-    assert_eq!(resp, IpcMessage::PingResponse(PingResponse { timestamp_ns: 999_111 }));
+    assert_eq!(
+        resp,
+        IpcMessage::PingResponse(PingResponse {
+            timestamp_ns: 999_111
+        })
+    );
     drop(stream);
 
     assert_eq!(daemon.signal(libc::SIGTERM), 0);
@@ -217,7 +233,9 @@ fn test_adversarial_truncated_frames_and_disconnects() {
     {
         let mut stream = UnixStream::connect(&socket).expect("connect");
         let partial_header = [0x4B, 0x33, 0x49, 0x50, 0x00, 0x00];
-        stream.write_all(&partial_header).expect("write partial header");
+        stream
+            .write_all(&partial_header)
+            .expect("write partial header");
         drop(stream);
     }
 
@@ -231,7 +249,9 @@ fn test_adversarial_truncated_frames_and_disconnects() {
         header[8..12].copy_from_slice(&64_u32.to_be_bytes()); // claims 64 bytes
 
         stream.write_all(&header).expect("write header");
-        stream.write_all(b"1234567890").expect("write partial payload");
+        stream
+            .write_all(b"1234567890")
+            .expect("write partial payload");
         drop(stream);
     }
 
@@ -250,10 +270,17 @@ fn test_adversarial_truncated_frames_and_disconnects() {
 
     // Verify daemon did not crash or hang
     let stream = UnixStream::connect(&socket).expect("connect to daemon");
-    let ping = IpcMessage::PingRequest(PingRequest { timestamp_ns: 123_456_789 });
+    let ping = IpcMessage::PingRequest(PingRequest {
+        timestamp_ns: 123_456_789,
+    });
     send_msg_frame(&stream, &ping, None).expect("send valid ping");
     let (resp, _) = recv_msg_frame(&stream).expect("recv ping response");
-    assert_eq!(resp, IpcMessage::PingResponse(PingResponse { timestamp_ns: 123_456_789 }));
+    assert_eq!(
+        resp,
+        IpcMessage::PingResponse(PingResponse {
+            timestamp_ns: 123_456_789
+        })
+    );
     drop(stream);
 
     assert_eq!(daemon.signal(libc::SIGTERM), 0);
@@ -297,10 +324,17 @@ fn test_adversarial_malformed_fory_payloads_return_protocol_error() {
     }
 
     // Verify subsequent valid request succeeds on the SAME stream
-    let ping = IpcMessage::PingRequest(PingRequest { timestamp_ns: 555_000 });
+    let ping = IpcMessage::PingRequest(PingRequest {
+        timestamp_ns: 555_000,
+    });
     send_msg_frame(&stream, &ping, None).expect("send ping");
     let (resp, _) = recv_msg_frame(&stream).expect("recv ping");
-    assert_eq!(resp, IpcMessage::PingResponse(PingResponse { timestamp_ns: 555_000 }));
+    assert_eq!(
+        resp,
+        IpcMessage::PingResponse(PingResponse {
+            timestamp_ns: 555_000
+        })
+    );
 
     drop(stream);
     assert_eq!(daemon.signal(libc::SIGTERM), 0);
@@ -397,20 +431,17 @@ fn test_adversarial_heavy_concurrent_clients_stress() {
 
                 // 3. Ping
                 let ts = u64::try_from(client_id * 1000 + iter).unwrap_or(0);
-                let ping = IpcMessage::PingRequest(PingRequest {
-                    timestamp_ns: ts,
-                });
+                let ping = IpcMessage::PingRequest(PingRequest { timestamp_ns: ts });
                 send_msg_frame(&stream, &ping, None).unwrap();
                 let (ping_resp, _) = recv_msg_frame(&stream).unwrap();
                 assert_eq!(
                     ping_resp,
-                    IpcMessage::PingResponse(PingResponse {
-                        timestamp_ns: ts,
-                    })
+                    IpcMessage::PingResponse(PingResponse { timestamp_ns: ts })
                 );
 
                 // 4. Deallocate
-                let dealloc_req = IpcMessage::DeallocateArenaRequest(DeallocateArenaRequest { arena_id });
+                let dealloc_req =
+                    IpcMessage::DeallocateArenaRequest(DeallocateArenaRequest { arena_id });
                 send_msg_frame(&stream, &dealloc_req, None).unwrap();
                 let (dealloc_resp, _) = recv_msg_frame(&stream).unwrap();
                 match dealloc_resp {
@@ -434,7 +465,10 @@ fn test_adversarial_heavy_concurrent_clients_stress() {
     let ping = IpcMessage::PingRequest(PingRequest { timestamp_ns: 42 });
     send_msg_frame(&stream, &ping, None).unwrap();
     let (resp, _) = recv_msg_frame(&stream).unwrap();
-    assert_eq!(resp, IpcMessage::PingResponse(PingResponse { timestamp_ns: 42 }));
+    assert_eq!(
+        resp,
+        IpcMessage::PingResponse(PingResponse { timestamp_ns: 42 })
+    );
     drop(stream);
 
     assert_eq!(daemon.signal(libc::SIGTERM), 0);
@@ -457,7 +491,9 @@ fn test_adversarial_client_sigkill_mid_transfer() {
 
     // Connect socket and write partial frame
     let mut stream = UnixStream::connect(&socket).expect("connect");
-    stream.write_all(b"\x4B\x33\x49\x50\x00\x00").expect("partial write");
+    stream
+        .write_all(b"\x4B\x33\x49\x50\x00\x00")
+        .expect("partial write");
 
     // Send SIGKILL to the dummy child to simulate abrupt process termination
     // SAFETY: SIGKILL sent to dummy child process.
@@ -471,10 +507,17 @@ fn test_adversarial_client_sigkill_mid_transfer() {
 
     // Verify daemon survived intact
     let stream2 = UnixStream::connect(&socket).expect("reconnect to daemon");
-    let ping = IpcMessage::PingRequest(PingRequest { timestamp_ns: 888_999 });
+    let ping = IpcMessage::PingRequest(PingRequest {
+        timestamp_ns: 888_999,
+    });
     send_msg_frame(&stream2, &ping, None).expect("send ping");
     let (resp, _) = recv_msg_frame(&stream2).expect("recv ping");
-    assert_eq!(resp, IpcMessage::PingResponse(PingResponse { timestamp_ns: 888_999 }));
+    assert_eq!(
+        resp,
+        IpcMessage::PingResponse(PingResponse {
+            timestamp_ns: 888_999
+        })
+    );
     drop(stream2);
 
     assert_eq!(daemon.signal(libc::SIGTERM), 0);
@@ -487,7 +530,10 @@ fn test_adversarial_socket_file_guard_and_stale_socket_recovery() {
     // Phase 1: Normal startup and SIGINT shutdown -> SocketFileGuard unlinks socket file
     {
         let mut d1 = TestDaemon::start(socket.clone(), None);
-        assert!(socket.exists(), "Socket file must exist while daemon is active");
+        assert!(
+            socket.exists(),
+            "Socket file must exist while daemon is active"
+        );
         let exit_code = d1.signal(libc::SIGINT);
         assert_eq!(exit_code, 0, "Daemon should exit 0 on SIGINT");
         assert!(
@@ -518,7 +564,10 @@ fn test_adversarial_socket_file_guard_and_stale_socket_recovery() {
         let ping = IpcMessage::PingRequest(PingRequest { timestamp_ns: 333 });
         send_msg_frame(&stream, &ping, None).expect("send ping");
         let (resp, _) = recv_msg_frame(&stream).expect("recv ping");
-        assert_eq!(resp, IpcMessage::PingResponse(PingResponse { timestamp_ns: 333 }));
+        assert_eq!(
+            resp,
+            IpcMessage::PingResponse(PingResponse { timestamp_ns: 333 })
+        );
         drop(stream);
 
         let exit_code = d3.signal(libc::SIGTERM);
@@ -575,4 +624,3 @@ fn test_adversarial_connected_client_blocks_graceful_shutdown() {
     // Socket file must have been unlinked upon graceful daemon termination
     assert!(!socket.exists(), "Socket file must be unlinked on SIGTERM");
 }
-
