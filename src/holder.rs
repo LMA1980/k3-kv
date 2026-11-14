@@ -17,14 +17,20 @@ use jero_core::K3Error;
 use jero_core::ipc::layout::{
     ARENA_MAGIC, ARENA_VERSION, ArenaHeader, BLOCK_SIZE_TOKENS, CACHELINE_ALIGNMENT, KvBlockMeta,
     OutputSlabHeader, RecurrentStateSlotHeader, SLAB_STATUS_IDLE, TAG_FREE, TokenInputSlotHeader,
+    estimate_recurrent_state_bytes,
 };
-use jero_core::ipc::protocol::{
-    AllocateArenaRequest, KV_DTYPE_F16, KV_DTYPE_F32, KV_DTYPE_Q8_0, StatusCode,
-};
+use jero_core::ipc::protocol::{AllocateArenaRequest, KV_DTYPE_F32, StatusCode};
 use jero_core::ipc::shm::{
     ArenaOptions, DEFAULT_LIMIT_MEMLOCK_BYTES, IpcError, SharedMemoryArena, system_page_size,
 };
-use jero_core::{KvCacheView, KvGeometry};
+use jero_core::{KvCacheView, KvDtype, KvGeometry, ScratchScope};
+
+use crate::quant_kv::{VECTOR_PLANE_ALIGNMENT, pack_kv_batch_plane, unpack_kv_range_plane};
+
+/// Reserved byte index inside [`ArenaHeader::_reserved`] indicating compressed `MLA` KV storage.
+///
+/// Positioned at index `8` after `kv_dtype` (`_reserved[0]`) and `seq_capacity` (`_reserved[4..8]`).
+const ARENA_RESERVED_MLA_FLAG_OFFSET: usize = 8;
 
 /// Maximum number of tokens tracked by each [`KvBlockMeta`] cacheline entry.
 pub const KV_BLOCK_TOKEN_CAPACITY: usize = BLOCK_SIZE_TOKENS as usize;
@@ -278,6 +284,17 @@ impl ArenaAllocationConfig {
         self.kv_dtype = kv_dtype;
         self
     }
+
+    /// Estimates the `O(1)` double-buffered recurrent state byte requirement (`slot_0 + slot_1`),
+    /// independent of `n_ctx`. Returns `0` when `num_recurrent_layers == 0`.
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if `num_recurrent_layers > 0` with zero state bytes
+    /// per layer, or if byte sizing overflows `u64`.
+    pub fn estimate_recurrent_state_bytes(&self) -> Result<u64, KvError> {
+        let (_, total) = compute_recurrent_bank_geometry(self)?;
+        Ok(total)
+    }
 }
 
 /// Detailed layout offsets and capacity computed for an arena.
@@ -289,6 +306,10 @@ pub struct ComputedArenaLayout {
     pub block_count: u32,
     /// Exact per-slot sequence capacity (`blocks_per_slot * 16`, or `0` when `num_layers == 0`).
     pub seq_capacity: u32,
+    /// Byte stride of a single K or V position row (`KvDtype::row_bytes(kv_dim)`, `0` when `num_layers == 0`).
+    pub kv_row_bytes: u64,
+    /// 128-byte aligned byte stride of a single layer K or V plane (`0` when `num_layers == 0`).
+    pub kv_plane_stride_bytes: u64,
     /// Byte offset to the [`KvBlockMeta`] table.
     pub meta_table_offset: u64,
     /// Byte offset to the token input slots region.
@@ -305,6 +326,26 @@ pub struct ComputedArenaLayout {
     pub recurrent_total_bytes: u64,
 }
 
+impl ComputedArenaLayout {
+    /// Returns the 128-byte aligned byte offset of `layer`'s K plane within a homogeneous arena.
+    #[must_use]
+    pub const fn k_plane_offset(&self, layer: u32) -> u64 {
+        self.kv_blocks_offset + (layer as u64) * 2 * self.kv_plane_stride_bytes
+    }
+
+    /// Returns the 128-byte aligned byte offset of `layer`'s V plane within a homogeneous arena.
+    #[must_use]
+    pub const fn v_plane_offset(&self, layer: u32) -> u64 {
+        self.k_plane_offset(layer) + self.kv_plane_stride_bytes
+    }
+
+    /// Returns the 128-byte aligned byte offset of `layer`'s single latent plane when `MLA` is active.
+    #[must_use]
+    pub const fn mla_plane_offset(&self, layer: u32) -> u64 {
+        self.kv_blocks_offset + (layer as u64) * self.kv_plane_stride_bytes
+    }
+}
+
 /// Aligns a 64-bit unsigned integer up to the nearest multiple of `align`.
 const fn align_up_u64(val: u64, align: u64) -> u64 {
     let rem = val % align;
@@ -317,22 +358,61 @@ const fn align_up_usize(val: usize, align: usize) -> usize {
     if rem == 0 { val } else { val + (align - rem) }
 }
 
-fn compute_per_layer_plane_row_bytes(kv_dim: u64, kv_dtype: u8) -> Result<u64, KvError> {
-    match kv_dtype {
-        KV_DTYPE_F32 => kv_dim
-            .checked_mul(size_of::<f32>() as u64)
-            .ok_or_else(|| KvError::InvalidDimensions("kv_row_bytes overflowed u64".to_owned())),
-        KV_DTYPE_F16 => kv_dim
-            .checked_mul(2)
-            .ok_or_else(|| KvError::InvalidDimensions("kv_row_bytes overflowed u64".to_owned())),
-        KV_DTYPE_Q8_0 => kv_dim
-            .div_ceil(32)
-            .checked_mul(34)
-            .ok_or_else(|| KvError::InvalidDimensions("kv_row_bytes overflowed u64".to_owned())),
-        other => Err(KvError::InvalidDimensions(format!(
-            "unsupported kv_dtype {other}; expected 0 (F32), 1 (F16), or 2 (Q8_0)"
-        ))),
+const fn output_slab_stride_u64(vocab_size: u32) -> Option<u64> {
+    let Some(raw) = (vocab_size as u64).checked_mul(size_of::<f32>() as u64) else {
+        return None;
+    };
+    let Some(with_hdr) = raw.checked_add(size_of::<OutputSlabHeader>() as u64) else {
+        return None;
+    };
+    Some(align_up_u64(with_hdr, VECTOR_PLANE_ALIGNMENT as u64))
+}
+
+fn compute_recurrent_bank_geometry(config: &ArenaAllocationConfig) -> Result<(u64, u64), KvError> {
+    if config.num_recurrent_layers == 0 {
+        return Ok((0, 0));
     }
+    if config.conv_state_bytes_per_layer == 0 && config.ssm_state_bytes_per_layer == 0 {
+        return Err(KvError::InvalidDimensions(
+            "recurrent state bytes per layer must be greater than zero".to_owned(),
+        ));
+    }
+    let align = CACHELINE_ALIGNMENT as u64;
+    let conv_aligned = align_up_u64(u64::from(config.conv_state_bytes_per_layer), align);
+    let ssm_aligned = align_up_u64(u64::from(config.ssm_state_bytes_per_layer), align);
+    if let (Ok(conv_u32), Ok(ssm_u32)) = (u32::try_from(conv_aligned), u32::try_from(ssm_aligned)) {
+        let total = estimate_recurrent_state_bytes(config.num_recurrent_layers, conv_u32, ssm_u32)
+            .map_err(|err| KvError::InvalidDimensions(err.to_string()))?;
+        let bank_stride = (total - (size_of::<RecurrentStateSlotHeader>() as u64)) / 2;
+        return Ok((bank_stride, total));
+    }
+    let per_layer_stride = conv_aligned.checked_add(ssm_aligned).ok_or_else(|| {
+        KvError::InvalidDimensions("recurrent per-layer stride overflowed u64".to_owned())
+    })?;
+    let bank_stride = u64::from(config.num_recurrent_layers)
+        .checked_mul(per_layer_stride)
+        .ok_or_else(|| {
+            KvError::InvalidDimensions("recurrent bank_stride overflowed u64".to_owned())
+        })?;
+    let two_banks = 2_u64.checked_mul(bank_stride).ok_or_else(|| {
+        KvError::InvalidDimensions("recurrent dual-bank size overflowed u64".to_owned())
+    })?;
+    let total_region = (size_of::<RecurrentStateSlotHeader>() as u64)
+        .checked_add(two_banks)
+        .ok_or_else(|| {
+            KvError::InvalidDimensions("recurrent_total_bytes overflowed u64".to_owned())
+        })?;
+    Ok((bank_stride, total_region))
+}
+
+fn compute_per_layer_plane_row_bytes(kv_dim: u64, kv_dtype: KvDtype) -> Result<u64, KvError> {
+    let kv_dim_usize = usize::try_from(kv_dim)
+        .map_err(|_| KvError::InvalidDimensions("kv_dim overflowed usize".to_owned()))?;
+    let row_usize = kv_dtype
+        .row_bytes(kv_dim_usize)
+        .map_err(|err| KvError::InvalidDimensions(err.to_string()))?;
+    u64::try_from(row_usize)
+        .map_err(|_| KvError::InvalidDimensions("kv_row_bytes overflowed u64".to_owned()))
 }
 
 /// Returns the token slot capacity bounded to [`BLOCK_SIZE_TOKENS`] for pure-recurrent (`O(1)`) arenas.
@@ -373,21 +453,8 @@ pub fn compute_arena_layout(
             "kv_latent_dim must be greater than zero".to_owned(),
         ));
     }
-    if config.num_recurrent_layers > 0
-        && config.conv_state_bytes_per_layer == 0
-        && config.ssm_state_bytes_per_layer == 0
-    {
-        return Err(KvError::InvalidDimensions(
-            "recurrent state bytes per layer must be greater than zero".to_owned(),
-        ));
-    }
-
-    if config.kv_dtype > KV_DTYPE_Q8_0 {
-        return Err(KvError::InvalidDimensions(format!(
-            "kv_dtype {} is invalid; expected 0 (F32), 1 (F16), or 2 (Q8_0)",
-            config.kv_dtype
-        )));
-    }
+    let kv_dtype = KvDtype::from_u8(config.kv_dtype)
+        .map_err(|err| KvError::InvalidDimensions(err.to_string()))?;
     if config.num_layers > 0 && config.kv_latent_dim.is_none() {
         if config.head_count_kv == 0 {
             return Err(KvError::InvalidDimensions(
@@ -401,9 +468,13 @@ pub fn compute_arena_layout(
         }
     }
 
+    let (recurrent_bank_stride_bytes, recurrent_total_bytes) =
+        compute_recurrent_bank_geometry(config)?;
+
     let active_slots = config.active_slots.max(1);
     let head_count_kv = config.head_count_kv.max(1);
     let vocab_size = config.vocab_size.max(1);
+    let plane_align = VECTOR_PLANE_ALIGNMENT as u64;
 
     // 1. Block count & per-slot seq_capacity: 16 tokens per block (0 for pure-recurrent O(1) arenas)
     let mut blocks_per_slot = if config.num_layers == 0 {
@@ -435,14 +506,14 @@ pub fn compute_arena_layout(
         .checked_add(meta_size)
         .ok_or_else(|| KvError::InvalidDimensions("meta_end overflowed u64".to_owned()))?;
 
-    // TokenInputSlot: cacheline aligned (64 bytes)
-    let token_slots_offset = align_up_u64(meta_end, CACHELINE_ALIGNMENT as u64);
+    // TokenInputSlot: 128-byte vector aligned
+    let token_slots_offset = align_up_u64(meta_end, plane_align);
     let slot_tokens = effective_token_slot_capacity(config);
     let per_slot_bytes = u64::from(slot_tokens)
         .checked_mul(size_of::<u32>() as u64)
         .and_then(|t| t.checked_add(size_of::<TokenInputSlotHeader>() as u64))
         .ok_or_else(|| KvError::InvalidDimensions("token slot size overflowed u64".to_owned()))?;
-    let aligned_slot_bytes = align_up_u64(per_slot_bytes, CACHELINE_ALIGNMENT as u64);
+    let aligned_slot_bytes = align_up_u64(per_slot_bytes, plane_align);
     let total_slots_bytes = aligned_slot_bytes
         .checked_mul(u64::from(active_slots))
         .ok_or_else(|| {
@@ -452,25 +523,27 @@ pub fn compute_arena_layout(
         .checked_add(total_slots_bytes)
         .ok_or_else(|| KvError::InvalidDimensions("token_slots_end overflowed u64".to_owned()))?;
 
-    // Contiguous layer-major KV slab `[slot][layer][K|V][pos][kv_dim]`: cacheline aligned (64 bytes)
-    let kv_blocks_offset = align_up_u64(token_slots_end, CACHELINE_ALIGNMENT as u64);
-    let total_kv_blocks_bytes = if config.num_layers == 0 {
-        0
+    // Contiguous layer-major KV slab `[slot][layer][K|V][pos][kv_dim]`: 128-byte vector aligned
+    let kv_blocks_offset = align_up_u64(token_slots_end, plane_align);
+    let (kv_row_bytes, kv_plane_stride_bytes, total_kv_blocks_bytes) = if config.num_layers == 0 {
+        (0_u64, 0_u64, 0_u64)
     } else {
         let kv_row_bytes = if let Some(latent_dim) = config.kv_latent_dim {
-            u64::from(latent_dim)
-                .checked_mul(size_of::<f32>() as u64)
-                .ok_or_else(|| {
-                    KvError::InvalidDimensions("kv_row_bytes overflowed u64".to_owned())
-                })?
+            compute_per_layer_plane_row_bytes(u64::from(latent_dim), kv_dtype)?
         } else {
             let kv_dim = u64::from(head_count_kv)
                 .checked_mul(u64::from(config.head_dim))
                 .ok_or_else(|| KvError::InvalidDimensions("kv_dim overflowed u64".to_owned()))?;
-            compute_per_layer_plane_row_bytes(kv_dim, config.kv_dtype)?
+            compute_per_layer_plane_row_bytes(kv_dim, kv_dtype)?
         };
         let planes_per_layer: u64 = if config.kv_latent_dim.is_some() { 1 } else { 2 };
-        if let Some(policies) = config.layer_policies.as_deref() {
+        let raw_plane_bytes = u64::from(seq_capacity)
+            .checked_mul(kv_row_bytes)
+            .ok_or_else(|| {
+                KvError::InvalidDimensions("kv_plane_bytes overflowed u64".to_owned())
+            })?;
+        let plane_stride = align_up_u64(raw_plane_bytes, plane_align);
+        let total_kv_bytes = if let Some(policies) = config.layer_policies.as_deref() {
             let expected_layers = usize::try_from(config.num_layers).unwrap_or(0);
             if policies.len() != expected_layers {
                 return Err(KvError::InvalidDimensions(format!(
@@ -478,39 +551,47 @@ pub fn compute_arena_layout(
                     policies.len()
                 )));
             }
-            let per_layer_bytes_per_token =
-                planes_per_layer.checked_mul(kv_row_bytes).ok_or_else(|| {
-                    KvError::InvalidDimensions(
-                        "per_layer_bytes_per_token overflowed u64".to_owned(),
-                    )
+            let mut slot_kv_bytes = 0_u64;
+            for &policy in policies {
+                let layer_tokens = match policy {
+                    LayerKvPolicy::GlobalFullContext => config.n_ctx,
+                    LayerKvPolicy::SlidingWindow { window_tokens } => {
+                        config.n_ctx.min(window_tokens)
+                    }
+                };
+                let layer_seq_cap = if layer_tokens == 0 {
+                    0_u64
+                } else {
+                    u64::from(layer_tokens.div_ceil(BLOCK_SIZE_TOKENS))
+                        .checked_mul(u64::from(BLOCK_SIZE_TOKENS))
+                        .ok_or_else(|| {
+                            KvError::InvalidDimensions(
+                                "hybrid layer_seq_cap overflowed u64".to_owned(),
+                            )
+                        })?
+                };
+                let layer_plane_raw = layer_seq_cap.checked_mul(kv_row_bytes).ok_or_else(|| {
+                    KvError::InvalidDimensions("hybrid layer_plane_raw overflowed u64".to_owned())
                 })?;
-            let layer_block_bytes = u64::from(BLOCK_SIZE_TOKENS)
-                .checked_mul(per_layer_bytes_per_token)
-                .ok_or_else(|| {
-                    KvError::InvalidDimensions("layer_block_bytes overflowed u64".to_owned())
+                let layer_plane_aligned = align_up_u64(layer_plane_raw, plane_align);
+                let layer_bytes = planes_per_layer
+                    .checked_mul(layer_plane_aligned)
+                    .ok_or_else(|| {
+                        KvError::InvalidDimensions("hybrid layer_bytes overflowed u64".to_owned())
+                    })?;
+                slot_kv_bytes = slot_kv_bytes.checked_add(layer_bytes).ok_or_else(|| {
+                    KvError::InvalidDimensions("hybrid slot_kv_bytes overflowed u64".to_owned())
                 })?;
-            let hybrid_blocks_per_slot = compute_hybrid_kv_block_count(config.n_ctx, policies);
-            let total_layer_blocks = u64::from(hybrid_blocks_per_slot)
-                .checked_mul(u64::from(active_slots))
-                .ok_or_else(|| {
-                    KvError::InvalidDimensions(
-                        "hybrid total_layer_blocks overflowed u64".to_owned(),
-                    )
-                })?;
-            total_layer_blocks
-                .checked_mul(layer_block_bytes)
+            }
+            u64::from(active_slots)
+                .checked_mul(slot_kv_bytes)
                 .ok_or_else(|| {
                     KvError::InvalidDimensions(
                         "hybrid total_kv_blocks_bytes overflowed u64".to_owned(),
                     )
                 })?
         } else {
-            let plane_bytes = u64::from(seq_capacity)
-                .checked_mul(kv_row_bytes)
-                .ok_or_else(|| {
-                    KvError::InvalidDimensions("kv_plane_bytes overflowed u64".to_owned())
-                })?;
-            let layer_bytes = planes_per_layer.checked_mul(plane_bytes).ok_or_else(|| {
+            let layer_bytes = planes_per_layer.checked_mul(plane_stride).ok_or_else(|| {
                 KvError::InvalidDimensions("kv_layer_bytes overflowed u64".to_owned())
             })?;
             let slot_bytes = u64::from(config.num_layers)
@@ -523,19 +604,17 @@ pub fn compute_arena_layout(
                 .ok_or_else(|| {
                     KvError::InvalidDimensions("total_kv_blocks_bytes overflowed u64".to_owned())
                 })?
-        }
+        };
+        (kv_row_bytes, plane_stride, total_kv_bytes)
     };
     let kv_blocks_end = kv_blocks_offset
         .checked_add(total_kv_blocks_bytes)
         .ok_or_else(|| KvError::InvalidDimensions("kv_blocks_end overflowed u64".to_owned()))?;
 
-    // OutputSlab: cacheline aligned (64 bytes)
-    let output_slabs_offset = align_up_u64(kv_blocks_end, CACHELINE_ALIGNMENT as u64);
-    let per_slab_bytes = u64::from(vocab_size)
-        .checked_mul(size_of::<f32>() as u64)
-        .and_then(|v| v.checked_add(size_of::<OutputSlabHeader>() as u64))
+    // OutputSlab: 128-byte vector aligned
+    let output_slabs_offset = align_up_u64(kv_blocks_end, plane_align);
+    let aligned_slab_bytes = output_slab_stride_u64(vocab_size)
         .ok_or_else(|| KvError::InvalidDimensions("slab_bytes overflowed u64".to_owned()))?;
-    let aligned_slab_bytes = align_up_u64(per_slab_bytes, CACHELINE_ALIGNMENT as u64);
     let total_slabs_bytes = aligned_slab_bytes
         .checked_mul(u64::from(active_slots))
         .ok_or_else(|| KvError::InvalidDimensions("total_slabs_bytes overflowed u64".to_owned()))?;
@@ -543,33 +622,12 @@ pub fn compute_arena_layout(
         .checked_add(total_slabs_bytes)
         .ok_or_else(|| KvError::InvalidDimensions("output_slabs_end overflowed u64".to_owned()))?;
 
-    // RecurrentStateSlotHeader + dual ping-pong banks immediately after output slabs (Option A)
-    let (recurrent_state_offset, recurrent_bank_stride_bytes, recurrent_total_bytes) =
-        if config.num_recurrent_layers > 0 {
-            let align = CACHELINE_ALIGNMENT as u64;
-            let conv_aligned = align_up_u64(u64::from(config.conv_state_bytes_per_layer), align);
-            let ssm_aligned = align_up_u64(u64::from(config.ssm_state_bytes_per_layer), align);
-            let per_layer_stride = conv_aligned.checked_add(ssm_aligned).ok_or_else(|| {
-                KvError::InvalidDimensions("recurrent per-layer stride overflowed u64".to_owned())
-            })?;
-            let bank_stride = u64::from(config.num_recurrent_layers)
-                .checked_mul(per_layer_stride)
-                .ok_or_else(|| {
-                    KvError::InvalidDimensions("recurrent bank_stride overflowed u64".to_owned())
-                })?;
-            let offset = align_up_u64(output_slabs_end, align);
-            let two_banks = 2_u64.checked_mul(bank_stride).ok_or_else(|| {
-                KvError::InvalidDimensions("recurrent dual-bank size overflowed u64".to_owned())
-            })?;
-            let total_region = (size_of::<RecurrentStateSlotHeader>() as u64)
-                .checked_add(two_banks)
-                .ok_or_else(|| {
-                    KvError::InvalidDimensions("recurrent_total_bytes overflowed u64".to_owned())
-                })?;
-            (offset, bank_stride, total_region)
-        } else {
-            (0, 0, 0)
-        };
+    // RecurrentStateSlotHeader + dual ping-pong banks immediately after output slabs
+    let recurrent_state_offset = if config.num_recurrent_layers > 0 {
+        align_up_u64(output_slabs_end, plane_align)
+    } else {
+        0
+    };
 
     let min_required_bytes = if config.num_recurrent_layers > 0 {
         recurrent_state_offset
@@ -593,6 +651,8 @@ pub fn compute_arena_layout(
         total_bytes,
         block_count,
         seq_capacity,
+        kv_row_bytes,
+        kv_plane_stride_bytes,
         meta_table_offset,
         token_slots_offset,
         kv_blocks_offset,
@@ -1071,15 +1131,11 @@ impl KvHolder {
 /// deterministically immediately after the output logit slabs, without modifying [`ArenaHeader`].
 #[must_use]
 pub fn recurrent_region_offset(header: &ArenaHeader) -> u64 {
-    let vocab_size = u64::from(header.vocab_size.max(1));
     let active_slots = u64::from(header.active_slots.max(1));
-    let per_slab_bytes = vocab_size
-        .saturating_mul(size_of::<f32>() as u64)
-        .saturating_add(size_of::<OutputSlabHeader>() as u64);
-    let aligned_slab_bytes = align_up_u64(per_slab_bytes, CACHELINE_ALIGNMENT as u64);
+    let aligned_slab_bytes = output_slab_stride_u64(header.vocab_size.max(1)).unwrap_or(u64::MAX);
     let total_slabs_bytes = aligned_slab_bytes.saturating_mul(active_slots);
     let output_slabs_end = header.output_slabs_offset.saturating_add(total_slabs_bytes);
-    align_up_u64(output_slabs_end, CACHELINE_ALIGNMENT as u64)
+    align_up_u64(output_slabs_end, VECTOR_PLANE_ALIGNMENT as u64)
 }
 
 /// Reads and validates a [`RecurrentStateSlotHeader`] from the beginning of a recurrent region slice.
@@ -1231,11 +1287,8 @@ fn populate_arena_header(
     config: &ArenaAllocationConfig,
     layout: &ComputedArenaLayout,
 ) -> Result<(), KvError> {
-    let mut reserved = [0_u8; 24];
-    reserved[..4].copy_from_slice(&layout.seq_capacity.to_le_bytes());
-    reserved[4] = config.kv_dtype;
-    reserved[5] = u8::from(config.kv_latent_dim.is_some());
-
+    let kv_dtype = KvDtype::from_u8(config.kv_dtype)
+        .map_err(|err| KvError::InvalidDimensions(err.to_string()))?;
     *hdr = ArenaHeader {
         magic: ARENA_MAGIC,
         version: ARENA_VERSION,
@@ -1257,8 +1310,11 @@ fn populate_arena_header(
         num_experts: 0,
         num_experts_per_tok: 0,
         derived_weights_offset: 0,
-        _reserved: reserved,
+        _reserved: [0_u8; 24],
     };
+    hdr.set_kv_dtype(kv_dtype);
+    hdr.set_seq_capacity(layout.seq_capacity);
+    hdr._reserved[ARENA_RESERVED_MLA_FLAG_OFFSET] = u8::from(config.kv_latent_dim.is_some());
     hdr.validate()
         .map_err(|msg| KvError::InvalidDimensions(msg.to_string()))
 }
@@ -1304,7 +1360,7 @@ fn initialize_arena_contents(
     let active_slots = config.active_slots.max(1) as usize;
     let raw_slot_bytes = effective_token_slot_capacity(config) as usize * size_of::<u32>()
         + size_of::<TokenInputSlotHeader>();
-    let per_slot_bytes = align_up_usize(raw_slot_bytes, CACHELINE_ALIGNMENT);
+    let per_slot_bytes = align_up_usize(raw_slot_bytes, VECTOR_PLANE_ALIGNMENT);
     let token_slots_base = usize::try_from(layout.token_slots_offset).map_err(|_| {
         KvError::InvalidDimensions("token_slots_offset exceeds address space".to_owned())
     })?;
@@ -1331,8 +1387,11 @@ fn initialize_arena_contents(
 
     // 4. Initialize OutputSlabHeader for active_slots
     let vocab_size = config.vocab_size.max(1);
-    let raw_slab_bytes = vocab_size as usize * size_of::<f32>() + size_of::<OutputSlabHeader>();
-    let per_slab_bytes = align_up_usize(raw_slab_bytes, CACHELINE_ALIGNMENT);
+    let per_slab_bytes = output_slab_stride_u64(vocab_size)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or_else(|| {
+            KvError::InvalidDimensions("output slab byte size overflowed usize".to_owned())
+        })?;
     let output_slabs_base = usize::try_from(layout.output_slabs_offset).map_err(|_| {
         KvError::InvalidDimensions("output_slabs_offset exceeds address space".to_owned())
     })?;
@@ -1406,12 +1465,7 @@ fn initialize_arena_contents(
 /// [`ArenaHeader`], avoiding slab-padding drift.
 #[must_use]
 pub fn arena_seq_capacity(header: &ArenaHeader) -> u32 {
-    let stored = u32::from_le_bytes([
-        header._reserved[0],
-        header._reserved[1],
-        header._reserved[2],
-        header._reserved[3],
-    ]);
+    let stored = header.seq_capacity();
     if stored > 0 {
         return stored;
     }
@@ -1422,7 +1476,7 @@ pub fn arena_seq_capacity(header: &ArenaHeader) -> u32 {
 /// Returns the KV cache element encoding (`KV_DTYPE_*`) recorded in [`ArenaHeader`].
 #[must_use]
 pub const fn arena_kv_dtype(header: &ArenaHeader) -> u8 {
-    header._reserved[4]
+    header._reserved[0]
 }
 
 /// Typed shared-memory handle exposing validated, bounds-checked views into an initialized arena.
@@ -1525,6 +1579,58 @@ impl<'a> ArenaHandle<'a> {
         self.kv_reader()?.committed_tokens()
     }
 
+    /// Reads and validates the active [`RecurrentStateSlotHeader`] for an `O(1)` recurrent or
+    /// hybrid arena.
+    ///
+    /// # Errors
+    /// Returns [`KvError`] if header validation fails, the arena has no recurrent state region,
+    /// or the slot header is invalid.
+    pub fn recurrent_header(&self) -> Result<RecurrentStateSlotHeader, KvError> {
+        let arena_hdr = self.header()?;
+        let rec_off = usize::try_from(recurrent_region_offset(arena_hdr)).map_err(|_| {
+            KvError::InvalidDimensions("recurrent_region_offset exceeds address space".to_owned())
+        })?;
+        let region = self.arena.as_slice().get(rec_off..).ok_or_else(|| {
+            KvError::IpcError("arena buffer missing recurrent state region".to_owned())
+        })?;
+        read_recurrent_slot_header_from_region(region)
+    }
+
+    /// Returns `(header, active_bank_readonly, inactive_bank_mutable)` for zero-tearing
+    /// ping-pong recurrent execution over this arena.
+    ///
+    /// # Errors
+    /// Returns [`KvError::IpcError`] if the arena is read-only or truncated, or
+    /// [`KvError::InvalidDimensions`] if header validation fails.
+    pub fn recurrent_banks_mut(
+        &mut self,
+    ) -> Result<(RecurrentStateSlotHeader, &[u8], &mut [u8]), KvError> {
+        if self.arena.is_read_only() {
+            return Err(KvError::IpcError(
+                "cannot obtain mutable recurrent banks from read-only SharedMemoryArena".to_owned(),
+            ));
+        }
+        recurrent_banks_in_arena_mut(self.arena.as_mut_slice())
+    }
+
+    /// Atomically publishes the inactive recurrent staging bank as the active bank with
+    /// `Release` ordering (`O(1)` ping-pong commit).
+    ///
+    /// # Errors
+    /// Returns [`KvError::IpcError`] if the arena is read-only or truncated, or
+    /// [`KvError::InvalidDimensions`] if `new_step` is non-monotonic or header validation fails.
+    pub fn commit_recurrent_step(
+        &mut self,
+        new_step: u32,
+    ) -> Result<RecurrentStateSlotHeader, KvError> {
+        if self.arena.is_read_only() {
+            return Err(KvError::IpcError(
+                "cannot commit recurrent step on read-only SharedMemoryArena".to_owned(),
+            ));
+        }
+        commit_recurrent_step_in_arena(self.arena.as_mut_slice(), new_step)
+    }
+
     /// Consumes the handle and returns the underlying [`SharedMemoryArena`].
     #[must_use]
     pub fn into_inner(self) -> &'a mut SharedMemoryArena {
@@ -1535,30 +1641,285 @@ impl<'a> ArenaHandle<'a> {
 const COMMITTED_TOKEN_COUNT_OFFSET: usize = offset_of!(KvBlockMeta, committed_token_count);
 const _: () = assert!(KV_BLOCK_TOKEN_CAPACITY == 16);
 
+fn align_up_usize_checked(value: usize, align: usize) -> Result<usize, KvError> {
+    debug_assert!(align.is_power_of_two());
+    let mask = align - 1;
+    value
+        .checked_add(mask)
+        .map(|aligned| aligned & !mask)
+        .ok_or_else(|| {
+            KvError::InvalidDimensions("aligned byte length overflowed usize".to_owned())
+        })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct KvSlabGeometry {
+    geometry: KvGeometry,
+    kv_dtype: KvDtype,
+    kv_dim: usize,
+    kv_row_bytes: usize,
+    raw_plane_bytes: usize,
+    kv_plane_stride_bytes: usize,
+}
+
+impl KvSlabGeometry {
+    const fn plane_len(self) -> usize {
+        self.geometry.seq_capacity * self.kv_dim
+    }
+
+    const fn valid_start_pos(self, end_pos: usize) -> usize {
+        match self.geometry.sliding_window {
+            Some(window) => end_pos.saturating_sub(window),
+            None => 0,
+        }
+    }
+
+    fn layer_plane_bounds(
+        self,
+        layer: usize,
+    ) -> Result<(core::ops::Range<usize>, core::ops::Range<usize>), KvError> {
+        if layer >= self.geometry.num_layers {
+            return Err(KvError::InvalidDimensions(format!(
+                "layer index {layer} out of bounds for num_layers={}",
+                self.geometry.num_layers
+            )));
+        }
+        let layer_stride = self.kv_plane_stride_bytes.checked_mul(2).ok_or_else(|| {
+            KvError::InvalidDimensions("KV layer byte stride overflowed usize".to_owned())
+        })?;
+        let k_start = layer.checked_mul(layer_stride).ok_or_else(|| {
+            KvError::InvalidDimensions("KV layer offset overflowed usize".to_owned())
+        })?;
+        let k_end = k_start.checked_add(self.raw_plane_bytes).ok_or_else(|| {
+            KvError::InvalidDimensions("KV K-plane end offset overflowed usize".to_owned())
+        })?;
+        let v_start = k_start
+            .checked_add(self.kv_plane_stride_bytes)
+            .ok_or_else(|| {
+                KvError::InvalidDimensions("KV V-plane offset overflowed usize".to_owned())
+            })?;
+        let v_end = v_start.checked_add(self.raw_plane_bytes).ok_or_else(|| {
+            KvError::InvalidDimensions("KV V-plane end offset overflowed usize".to_owned())
+        })?;
+        Ok((k_start..k_end, v_start..v_end))
+    }
+
+    fn validate_pos_range(
+        self,
+        start_pos: usize,
+        end_pos: usize,
+    ) -> Result<(usize, usize), KvError> {
+        if start_pos > end_pos {
+            return Err(KvError::InvalidDimensions(format!(
+                "start_pos ({start_pos}) > end_pos ({end_pos})"
+            )));
+        }
+        if end_pos > self.geometry.seq_capacity {
+            return Err(KvError::InvalidDimensions(format!(
+                "end_pos ({end_pos}) exceeds seq_capacity ({})",
+                self.geometry.seq_capacity
+            )));
+        }
+        let seq_len = end_pos - start_pos;
+        let elem_len = seq_len.checked_mul(self.kv_dim).ok_or_else(|| {
+            KvError::InvalidDimensions("KV element range length overflowed usize".to_owned())
+        })?;
+        Ok((seq_len, elem_len))
+    }
+
+    fn validate_batch_write(
+        self,
+        layer: usize,
+        start_pos: usize,
+        k_len: usize,
+        v_len: usize,
+    ) -> Result<(usize, usize), KvError> {
+        if layer >= self.geometry.num_layers {
+            return Err(KvError::InvalidDimensions(format!(
+                "layer index {layer} out of bounds for num_layers={}",
+                self.geometry.num_layers
+            )));
+        }
+        if k_len != v_len {
+            return Err(KvError::InvalidDimensions(format!(
+                "k_batch len ({k_len}) does not match v_batch len ({v_len})"
+            )));
+        }
+        if k_len % self.kv_dim != 0 {
+            return Err(KvError::InvalidDimensions(format!(
+                "k_batch len ({k_len}) is not a multiple of kv_dim ({})",
+                self.kv_dim
+            )));
+        }
+        let seq_len = k_len / self.kv_dim;
+        let end_pos = start_pos.checked_add(seq_len).ok_or_else(|| {
+            KvError::InvalidDimensions("append batch end_pos overflowed usize".to_owned())
+        })?;
+        if end_pos > self.geometry.seq_capacity {
+            return Err(KvError::InvalidDimensions(format!(
+                "batch span [{start_pos}..{end_pos}) exceeds seq_capacity ({})",
+                self.geometry.seq_capacity
+            )));
+        }
+        Ok((seq_len, end_pos))
+    }
+}
+
+fn read_kv_bytes_planes(
+    kv_bytes: &[u8],
+    slab: KvSlabGeometry,
+    layer: usize,
+) -> Result<(&[u8], &[u8]), KvError> {
+    let (k_range, v_range) = slab.layer_plane_bounds(layer)?;
+    let k_plane = kv_bytes.get(k_range).ok_or_else(|| {
+        KvError::InvalidDimensions("KV slab K-plane range exceeds buffer bounds".to_owned())
+    })?;
+    let v_plane = kv_bytes.get(v_range).ok_or_else(|| {
+        KvError::InvalidDimensions("KV slab V-plane range exceeds buffer bounds".to_owned())
+    })?;
+    Ok((k_plane, v_plane))
+}
+
+fn read_kv_f32_planes(
+    kv_bytes: &[u8],
+    slab: KvSlabGeometry,
+    layer: usize,
+) -> Result<(&[f32], &[f32]), KvError> {
+    if slab.kv_dtype != KvDtype::F32 {
+        return Err(KvError::InvalidDimensions(format!(
+            "contiguous &[f32] KV plane view requires F32 dtype, got {:?}",
+            slab.kv_dtype
+        )));
+    }
+    let (k_plane, v_plane) = read_kv_bytes_planes(kv_bytes, slab, layer)?;
+    let k_f32 = <[f32]>::ref_from_bytes(k_plane).map_err(|err| {
+        KvError::InvalidDimensions(format!("KV K-plane f32 conversion failed: {err:?}"))
+    })?;
+    let v_f32 = <[f32]>::ref_from_bytes(v_plane).map_err(|err| {
+        KvError::InvalidDimensions(format!("KV V-plane f32 conversion failed: {err:?}"))
+    })?;
+    Ok((k_f32, v_f32))
+}
+
+fn read_kv_f32_range(
+    kv_bytes: &[u8],
+    slab: KvSlabGeometry,
+    layer: usize,
+    start_pos: usize,
+    end_pos: usize,
+) -> Result<(&[f32], &[f32]), KvError> {
+    let (_seq_len, _elem_len) = slab.validate_pos_range(start_pos, end_pos)?;
+    let (k_plane, v_plane) = read_kv_f32_planes(kv_bytes, slab, layer)?;
+    let elem_start = start_pos
+        .checked_mul(slab.kv_dim)
+        .ok_or_else(|| KvError::InvalidDimensions("elem_start overflowed usize".to_owned()))?;
+    let elem_end = end_pos
+        .checked_mul(slab.kv_dim)
+        .ok_or_else(|| KvError::InvalidDimensions("elem_end overflowed usize".to_owned()))?;
+    Ok((
+        &k_plane[elem_start..elem_end],
+        &v_plane[elem_start..elem_end],
+    ))
+}
+
+fn write_kv_f32_planes<'a>(
+    kv_bytes: &'a mut [u8],
+    slab: KvSlabGeometry,
+    layer: usize,
+    start_pos: usize,
+    k_batch: &[f32],
+    v_batch: &[f32],
+) -> Result<(&'a [f32], &'a [f32]), KvError> {
+    if slab.kv_dtype != KvDtype::F32 {
+        return Err(KvError::InvalidDimensions(format!(
+            "append_layer_batch requires F32 KV cache, got {:?}; use append_quantized_kv_batch",
+            slab.kv_dtype
+        )));
+    }
+    let (_seq_len, end_pos) =
+        slab.validate_batch_write(layer, start_pos, k_batch.len(), v_batch.len())?;
+    let (k_range, v_range) = slab.layer_plane_bounds(layer)?;
+    if v_range.end > kv_bytes.len() {
+        return Err(KvError::InvalidDimensions(
+            "KV layer plane range exceeds slab byte length".to_owned(),
+        ));
+    }
+    let elem_start = start_pos
+        .checked_mul(slab.kv_dim)
+        .ok_or_else(|| KvError::InvalidDimensions("elem_start overflowed usize".to_owned()))?;
+    let elem_end = end_pos
+        .checked_mul(slab.kv_dim)
+        .ok_or_else(|| KvError::InvalidDimensions("elem_end overflowed usize".to_owned()))?;
+    let (prefix, tail) = kv_bytes.split_at_mut(v_range.start);
+    let k_plane = <[f32]>::mut_from_bytes(&mut prefix[k_range]).map_err(|err| {
+        KvError::InvalidDimensions(format!("KV K-plane f32 conversion failed: {err:?}"))
+    })?;
+    let v_plane = <[f32]>::mut_from_bytes(&mut tail[..v_range.len()]).map_err(|err| {
+        KvError::InvalidDimensions(format!("KV V-plane f32 conversion failed: {err:?}"))
+    })?;
+    k_plane[elem_start..elem_end].copy_from_slice(k_batch);
+    v_plane[elem_start..elem_end].copy_from_slice(v_batch);
+    Ok((&k_plane[..elem_end], &v_plane[..elem_end]))
+}
+
+fn unpack_kv_planes_range_f32<'o>(
+    slab: KvSlabGeometry,
+    k_plane: &[u8],
+    v_plane: &[u8],
+    pos_range: core::ops::Range<usize>,
+    k_out: &'o mut [f32],
+    v_out: &'o mut [f32],
+) -> Result<(&'o [f32], &'o [f32]), KvError> {
+    let k_written = unpack_kv_range_plane(
+        slab.kv_dtype,
+        slab.kv_dim,
+        pos_range.start,
+        pos_range.end,
+        k_plane,
+        k_out,
+    )?;
+    let v_written = unpack_kv_range_plane(
+        slab.kv_dtype,
+        slab.kv_dim,
+        pos_range.start,
+        pos_range.end,
+        v_plane,
+        v_out,
+    )?;
+    debug_assert_eq!(k_written, v_written);
+    Ok((&k_out[..k_written], &v_out[..v_written]))
+}
+
+fn alloc_scratch_kv_pair<'s>(
+    scope: &'s ScratchScope<'_>,
+    total_elems: usize,
+) -> Result<(&'s mut [f32], &'s mut [f32]), KvError> {
+    if total_elems == 0 {
+        return Ok((&mut [], &mut []));
+    }
+    let k_buf = scope
+        .alloc_f32(total_elems)
+        .map_err(|err| KvError::InvalidDimensions(err.to_string()))?;
+    let v_buf = scope
+        .alloc_f32(total_elems)
+        .map_err(|err| KvError::InvalidDimensions(err.to_string()))?;
+    Ok((k_buf, v_buf))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ValidatedArenaKvSlab {
-    geometry: KvGeometry,
+    slab: KvSlabGeometry,
     kv_offset: usize,
     kv_end: usize,
 }
 
-fn validate_arena_kv_slab(arena_bytes: &[u8]) -> Result<ValidatedArenaKvSlab, KvError> {
-    let (header, _) = ArenaHeader::ref_from_prefix(arena_bytes).map_err(|_| {
-        KvError::InvalidDimensions("arena buffer smaller than ArenaHeader".to_owned())
-    })?;
-    header
-        .validate()
-        .map_err(|msg| KvError::InvalidDimensions(format!("invalid ArenaHeader: {msg}")))?;
-
-    let kv_dtype = arena_kv_dtype(header);
-    if kv_dtype != KV_DTYPE_F32 {
-        return Err(KvError::InvalidDimensions(format!(
-            "KvCacheView requires F32 KV cache (kv_dtype=0), got {kv_dtype}"
-        )));
-    }
-    if header._reserved[5] != 0 {
+fn extract_slab_geometry(header: &ArenaHeader) -> Result<KvSlabGeometry, KvError> {
+    let kv_dtype = header
+        .kv_dtype()
+        .map_err(|err| KvError::InvalidDimensions(err.to_string()))?;
+    if header._reserved[ARENA_RESERVED_MLA_FLAG_OFFSET] != 0 {
         return Err(KvError::InvalidDimensions(
-            "KvCacheView does not support MLA latent-compressed KV slabs".to_owned(),
+            "KV slab view/reader does not support MLA latent-compressed KV slabs".to_owned(),
         ));
     }
     if header.num_layers == 0 || header.head_count_kv == 0 || header.head_dim == 0 {
@@ -1595,14 +1956,6 @@ fn validate_arena_kv_slab(arena_bytes: &[u8]) -> Result<ValidatedArenaKvSlab, Kv
         None
     };
 
-    let kv_offset = usize::try_from(header.kv_blocks_offset)
-        .map_err(|_| KvError::InvalidDimensions("kv_blocks_offset overflowed usize".to_owned()))?;
-    let output_offset = usize::try_from(header.output_slabs_offset).map_err(|_| {
-        KvError::InvalidDimensions("output_slabs_offset overflowed usize".to_owned())
-    })?;
-    let total_bytes = usize::try_from(header.total_bytes)
-        .map_err(|_| KvError::InvalidDimensions("total_bytes overflowed usize".to_owned()))?;
-
     let geometry = KvGeometry::new(
         num_layers,
         n_heads_kv,
@@ -1611,12 +1964,59 @@ fn validate_arena_kv_slab(arena_bytes: &[u8]) -> Result<ValidatedArenaKvSlab, Kv
         sliding_window,
     )
     .map_err(|err| KvError::InvalidDimensions(err.to_string()))?;
-    let required_f32s = geometry
-        .required_f32_len()
+    let kv_dim = geometry
+        .kv_dim()
         .map_err(|err| KvError::InvalidDimensions(err.to_string()))?;
-    let required_bytes = required_f32s.checked_mul(size_of::<f32>()).ok_or_else(|| {
-        KvError::InvalidDimensions("KV slab byte length overflowed usize".to_owned())
+    let kv_row_bytes = geometry
+        .row_bytes(kv_dtype)
+        .map_err(|err| KvError::InvalidDimensions(err.to_string()))?;
+    let raw_plane_bytes = geometry
+        .plane_bytes(kv_dtype)
+        .map_err(|err| KvError::InvalidDimensions(err.to_string()))?;
+    let kv_plane_stride_bytes = align_up_usize_checked(raw_plane_bytes, VECTOR_PLANE_ALIGNMENT)?;
+
+    Ok(KvSlabGeometry {
+        geometry,
+        kv_dtype,
+        kv_dim,
+        kv_row_bytes,
+        raw_plane_bytes,
+        kv_plane_stride_bytes,
+    })
+}
+
+fn validate_arena_kv_slab(arena_bytes: &[u8]) -> Result<ValidatedArenaKvSlab, KvError> {
+    let (header, _) = ArenaHeader::ref_from_prefix(arena_bytes).map_err(|_| {
+        KvError::InvalidDimensions("arena buffer smaller than ArenaHeader".to_owned())
     })?;
+    header
+        .validate()
+        .map_err(|msg| KvError::InvalidDimensions(format!("invalid ArenaHeader: {msg}")))?;
+
+    let slab = extract_slab_geometry(header)?;
+    let kv_offset = usize::try_from(header.kv_blocks_offset)
+        .map_err(|_| KvError::InvalidDimensions("kv_blocks_offset overflowed usize".to_owned()))?;
+    if kv_offset % VECTOR_PLANE_ALIGNMENT != 0 {
+        return Err(KvError::InvalidDimensions(format!(
+            "kv_blocks_offset ({kv_offset}) must be {VECTOR_PLANE_ALIGNMENT}-byte aligned"
+        )));
+    }
+    let output_offset = usize::try_from(header.output_slabs_offset).map_err(|_| {
+        KvError::InvalidDimensions("output_slabs_offset overflowed usize".to_owned())
+    })?;
+    let total_bytes = usize::try_from(header.total_bytes)
+        .map_err(|_| KvError::InvalidDimensions("total_bytes overflowed usize".to_owned()))?;
+
+    let total_planes =
+        slab.geometry.num_layers.checked_mul(2).ok_or_else(|| {
+            KvError::InvalidDimensions("KV plane count overflowed usize".to_owned())
+        })?;
+    let required_bytes = slab
+        .kv_plane_stride_bytes
+        .checked_mul(total_planes)
+        .ok_or_else(|| {
+            KvError::InvalidDimensions("KV slab byte length overflowed usize".to_owned())
+        })?;
     let kv_end = kv_offset.checked_add(required_bytes).ok_or_else(|| {
         KvError::InvalidDimensions("KV slab end offset overflowed usize".to_owned())
     })?;
@@ -1633,7 +2033,7 @@ fn validate_arena_kv_slab(arena_bytes: &[u8]) -> Result<ValidatedArenaKvSlab, Kv
     }
 
     Ok(ValidatedArenaKvSlab {
-        geometry,
+        slab,
         kv_offset,
         kv_end,
     })
@@ -1857,37 +2257,81 @@ fn commit_token_span_in_meta(
     Ok(())
 }
 
+fn unpack_kv_planes_in_scratch<'s>(
+    slab: KvSlabGeometry,
+    k_plane: &[u8],
+    v_plane: &[u8],
+    start_pos: usize,
+    end_pos: usize,
+    scope: &'s ScratchScope<'_>,
+) -> Result<(&'s [f32], &'s [f32]), KvError> {
+    let (_seq_len, elem_len) = slab.validate_pos_range(start_pos, end_pos)?;
+    let (k_buf, v_buf) = alloc_scratch_kv_pair(scope, elem_len)?;
+    unpack_kv_planes_range_f32(slab, k_plane, v_plane, start_pos..end_pos, k_buf, v_buf)
+}
+
+#[derive(Debug)]
+enum WriterBacking<'a> {
+    F32View(KvCacheView<'a>),
+    Bytes {
+        kv_bytes: &'a mut [u8],
+        slab: KvSlabGeometry,
+    },
+}
+
 /// Zero-copy batched KV slab writer and atomic [`KvBlockMeta`] committer over an initialized arena.
 #[derive(Debug)]
 pub struct ArenaKvWriter<'a> {
-    kv_view: KvCacheView<'a>,
+    backing: WriterBacking<'a>,
     meta_bytes: &'a mut [u8],
     logical_block_count: usize,
 }
 
 impl<'a> ArenaKvWriter<'a> {
+    fn slab(&self) -> KvSlabGeometry {
+        match &self.backing {
+            WriterBacking::F32View(view) => {
+                let geometry = view.geometry();
+                let kv_dim = view.kv_dim();
+                let kv_row_bytes = kv_dim * size_of::<f32>();
+                let raw_plane_bytes = geometry.seq_capacity * kv_row_bytes;
+                KvSlabGeometry {
+                    geometry,
+                    kv_dtype: KvDtype::F32,
+                    kv_dim,
+                    kv_row_bytes,
+                    raw_plane_bytes,
+                    kv_plane_stride_bytes: raw_plane_bytes,
+                }
+            }
+            WriterBacking::Bytes { slab, .. } => *slab,
+        }
+    }
+
     /// Wraps an initialized shared memory arena byte slice in a bounds-checked [`ArenaKvWriter`].
+    ///
+    /// Supports `F32`, `F16`, and `Q8_0` KV slabs aligned to [`VECTOR_PLANE_ALIGNMENT`].
     ///
     /// # Errors
     /// Returns [`KvError::InvalidDimensions`] if header, KV slab, or `KvBlockMeta` bounds fail, or
     /// [`KvError::IpcError`] if alignment is invalid for `AtomicU32` metadata commits.
     pub fn from_arena_slice(arena_bytes: &'a mut [u8]) -> Result<Self, KvError> {
-        let slab = validate_arena_kv_slab(arena_bytes)?;
-        let (meta_offset, meta_end, logical_block_count) =
-            validate_arena_meta_bounds(arena_bytes, slab.geometry.seq_capacity, slab.kv_offset)?;
-        let (head, tail) = arena_bytes.split_at_mut(slab.kv_offset);
+        let validated = validate_arena_kv_slab(arena_bytes)?;
+        let (meta_offset, meta_end, logical_block_count) = validate_arena_meta_bounds(
+            arena_bytes,
+            validated.slab.geometry.seq_capacity,
+            validated.kv_offset,
+        )?;
+        let (head, tail) = arena_bytes.split_at_mut(validated.kv_offset);
         let meta_bytes = &mut head[meta_offset..meta_end];
         validate_meta_slice_for_atomic(meta_bytes, logical_block_count)?;
 
-        let kv_bytes = &mut tail[..(slab.kv_end - slab.kv_offset)];
-        let kv_f32s = <[f32]>::mut_from_bytes(kv_bytes).map_err(|err| {
-            KvError::InvalidDimensions(format!("KV slab byte slice conversion failed: {err:?}"))
-        })?;
-        let kv_view = KvCacheView::new(kv_f32s, slab.geometry)
-            .map_err(|err| KvError::InvalidDimensions(err.to_string()))?;
-
+        let kv_bytes = &mut tail[..(validated.kv_end - validated.kv_offset)];
         Ok(Self {
-            kv_view,
+            backing: WriterBacking::Bytes {
+                kv_bytes,
+                slab: validated.slab,
+            },
             meta_bytes,
             logical_block_count,
         })
@@ -1933,7 +2377,7 @@ impl<'a> ArenaKvWriter<'a> {
         let meta_bytes = block_meta.as_mut_bytes();
         validate_meta_slice_for_atomic(meta_bytes, logical_block_count)?;
         Ok(Self {
-            kv_view,
+            backing: WriterBacking::F32View(kv_view),
             meta_bytes,
             logical_block_count,
         })
@@ -1942,19 +2386,54 @@ impl<'a> ArenaKvWriter<'a> {
     /// Returns the validated [`KvGeometry`].
     #[must_use]
     pub const fn geometry(&self) -> KvGeometry {
-        self.kv_view.geometry()
+        match &self.backing {
+            WriterBacking::F32View(view) => view.geometry(),
+            WriterBacking::Bytes { slab, .. } => slab.geometry,
+        }
     }
 
     /// Returns the maximum sequence token capacity (`seq_capacity`).
     #[must_use]
     pub const fn seq_capacity(&self) -> usize {
-        self.kv_view.seq_capacity()
+        self.geometry().seq_capacity
     }
 
     /// Returns the per-position vector width (`n_heads_kv * head_dim`).
     #[must_use]
     pub const fn kv_dim(&self) -> usize {
-        self.kv_view.kv_dim()
+        match &self.backing {
+            WriterBacking::F32View(view) => view.kv_dim(),
+            WriterBacking::Bytes { slab, .. } => slab.kv_dim,
+        }
+    }
+
+    /// Returns the element encoding ([`KvDtype`]) of the underlying KV slab.
+    #[must_use]
+    pub const fn kv_dtype(&self) -> KvDtype {
+        match &self.backing {
+            WriterBacking::F32View(_) => KvDtype::F32,
+            WriterBacking::Bytes { slab, .. } => slab.kv_dtype,
+        }
+    }
+
+    /// Returns the encoded byte stride per token row (`KvDtype::row_bytes(kv_dim)`).
+    #[must_use]
+    pub const fn kv_row_bytes(&self) -> usize {
+        match &self.backing {
+            WriterBacking::F32View(view) => view.kv_dim() * size_of::<f32>(),
+            WriterBacking::Bytes { slab, .. } => slab.kv_row_bytes,
+        }
+    }
+
+    /// Returns the aligned byte stride between consecutive K/V planes.
+    #[must_use]
+    pub const fn kv_plane_stride_bytes(&self) -> usize {
+        match &self.backing {
+            WriterBacking::F32View(view) => {
+                view.geometry().seq_capacity * view.kv_dim() * size_of::<f32>()
+            }
+            WriterBacking::Bytes { slab, .. } => slab.kv_plane_stride_bytes,
+        }
     }
 
     /// Returns the number of 16-token blocks backing `seq_capacity`.
@@ -1963,25 +2442,32 @@ impl<'a> ArenaKvWriter<'a> {
         self.logical_block_count
     }
 
-    /// Returns shared access to the underlying [`KvCacheView`].
+    /// Returns shared access to the underlying [`KvCacheView`] when constructed via [`Self::from_parts`].
     #[must_use]
-    pub const fn kv_cache_view(&self) -> &KvCacheView<'a> {
-        &self.kv_view
+    pub const fn kv_cache_view(&self) -> Option<&KvCacheView<'a>> {
+        match &self.backing {
+            WriterBacking::F32View(view) => Some(view),
+            WriterBacking::Bytes { .. } => None,
+        }
     }
 
-    /// Returns mutable access to the underlying [`KvCacheView`].
+    /// Returns mutable access to the underlying [`KvCacheView`] when constructed via [`Self::from_parts`].
     #[must_use]
-    pub fn kv_cache_view_mut(&mut self) -> &mut KvCacheView<'a> {
-        &mut self.kv_view
+    pub fn kv_cache_view_mut(&mut self) -> Option<&mut KvCacheView<'a>> {
+        match &mut self.backing {
+            WriterBacking::F32View(view) => Some(view),
+            WriterBacking::Bytes { .. } => None,
+        }
     }
 
-    /// Copies contiguous `[seq_len, kv_dim]` K and V batch slices for `layer` starting at
+    /// Copies contiguous `[seq_len, kv_dim]` `F32` K and V batch slices for `layer` starting at
     /// `start_pos` in a single copy per plane, returning contiguous `0..(start_pos + seq_len)`
     /// `(k_prefix, v_prefix)` reader slices.
     ///
     /// # Errors
-    /// Returns [`KvError::InvalidDimensions`] if `layer >= num_layers`, `k_batch.len() != v_batch.len()`,
-    /// slice lengths are not multiples of `kv_dim`, or `start_pos + seq_len > seq_capacity`.
+    /// Returns [`KvError::InvalidDimensions`] if `kv_dtype != F32`, `layer >= num_layers`,
+    /// `k_batch.len() != v_batch.len()`, slice lengths are not multiples of `kv_dim`, or
+    /// `start_pos + seq_len > seq_capacity`.
     pub fn append_layer_batch(
         &mut self,
         layer: usize,
@@ -1989,92 +2475,228 @@ impl<'a> ArenaKvWriter<'a> {
         k_batch: &[f32],
         v_batch: &[f32],
     ) -> Result<(&[f32], &[f32]), KvError> {
-        let geom = self.kv_view.geometry();
-        let kv_dim = self.kv_view.kv_dim();
-        if layer >= geom.num_layers {
-            return Err(KvError::InvalidDimensions(format!(
-                "layer index {layer} out of bounds for num_layers={}",
-                geom.num_layers
-            )));
+        let slab = self.slab();
+        match &mut self.backing {
+            WriterBacking::F32View(view) => {
+                let (_seq_len, end_pos) =
+                    slab.validate_batch_write(layer, start_pos, k_batch.len(), v_batch.len())?;
+                let elem_start = start_pos.checked_mul(slab.kv_dim).ok_or_else(|| {
+                    KvError::InvalidDimensions("elem_start overflowed usize".to_owned())
+                })?;
+                let elem_end = end_pos.checked_mul(slab.kv_dim).ok_or_else(|| {
+                    KvError::InvalidDimensions("elem_end overflowed usize".to_owned())
+                })?;
+                let (k_plane, v_plane) = view
+                    .layer_kv_mut(layer)
+                    .map_err(|err| KvError::InvalidDimensions(err.to_string()))?;
+                k_plane[elem_start..elem_end].copy_from_slice(k_batch);
+                v_plane[elem_start..elem_end].copy_from_slice(v_batch);
+                Ok((&k_plane[..elem_end], &v_plane[..elem_end]))
+            }
+            WriterBacking::Bytes { kv_bytes, slab } => {
+                write_kv_f32_planes(kv_bytes, *slab, layer, start_pos, k_batch, v_batch)
+            }
         }
-        if k_batch.len() != v_batch.len() {
-            return Err(KvError::InvalidDimensions(format!(
-                "k_batch len ({}) does not match v_batch len ({})",
-                k_batch.len(),
-                v_batch.len()
-            )));
-        }
-        if k_batch.len() % kv_dim != 0 {
-            return Err(KvError::InvalidDimensions(format!(
-                "k_batch len ({}) is not a multiple of kv_dim ({kv_dim})",
-                k_batch.len()
-            )));
-        }
-        let seq_len = k_batch.len() / kv_dim;
-        let end_pos = start_pos.checked_add(seq_len).ok_or_else(|| {
-            KvError::InvalidDimensions("append_layer_batch end_pos overflowed usize".to_owned())
-        })?;
-        if end_pos > geom.seq_capacity {
-            return Err(KvError::InvalidDimensions(format!(
-                "batch span [{start_pos}..{end_pos}) exceeds seq_capacity ({})",
-                geom.seq_capacity
-            )));
-        }
-        let elem_start = start_pos
-            .checked_mul(kv_dim)
-            .ok_or_else(|| KvError::InvalidDimensions("elem_start overflowed usize".to_owned()))?;
-        let elem_end = end_pos
-            .checked_mul(kv_dim)
-            .ok_or_else(|| KvError::InvalidDimensions("elem_end overflowed usize".to_owned()))?;
-
-        let (k_plane, v_plane) = self
-            .kv_view
-            .layer_kv_mut(layer)
-            .map_err(|err| KvError::InvalidDimensions(err.to_string()))?;
-        k_plane[elem_start..elem_end].copy_from_slice(k_batch);
-        v_plane[elem_start..elem_end].copy_from_slice(v_batch);
-        Ok((&k_plane[..elem_end], &v_plane[..elem_end]))
     }
 
-    /// Returns contiguous `0..end_pos` immutable `(k_prefix, v_prefix)` slices for `layer`.
+    /// Packs and writes contiguous `[seq_len, kv_dim]` `f32` K and V batch slices into `layer`
+    /// starting at `start_pos` using the slab's [`KvDtype`] (`F32`, `F16`, or `Q8_0`), returning
+    /// the updated exclusive end token position (`start_pos + seq_len`).
     ///
     /// # Errors
-    /// Returns [`KvError::InvalidDimensions`] if `layer >= num_layers` or `end_pos > seq_capacity`.
+    /// Returns [`KvError::InvalidDimensions`] if `layer >= num_layers`, `k_batch.len() != v_batch.len()`,
+    /// lengths are not multiples of `kv_dim`, `start_pos + seq_len > seq_capacity`, or `Q8_0`
+    /// packing bounds fail.
+    pub fn append_quantized_kv_batch(
+        &mut self,
+        layer: usize,
+        start_pos: usize,
+        k_batch: &[f32],
+        v_batch: &[f32],
+    ) -> Result<usize, KvError> {
+        let slab = self.slab();
+        let (_seq_len, end_pos) =
+            slab.validate_batch_write(layer, start_pos, k_batch.len(), v_batch.len())?;
+        match &mut self.backing {
+            WriterBacking::F32View(view) => {
+                let (k_plane, v_plane) = view
+                    .layer_kv_mut(layer)
+                    .map_err(|err| KvError::InvalidDimensions(err.to_string()))?;
+                pack_kv_batch_plane(
+                    KvDtype::F32,
+                    slab.kv_dim,
+                    start_pos,
+                    k_batch,
+                    k_plane.as_mut_bytes(),
+                )?;
+                pack_kv_batch_plane(
+                    KvDtype::F32,
+                    slab.kv_dim,
+                    start_pos,
+                    v_batch,
+                    v_plane.as_mut_bytes(),
+                )?;
+            }
+            WriterBacking::Bytes { kv_bytes, slab } => {
+                let (k_range, v_range) = slab.layer_plane_bounds(layer)?;
+                if v_range.end > kv_bytes.len() {
+                    return Err(KvError::InvalidDimensions(
+                        "KV layer plane range exceeds slab byte length".to_owned(),
+                    ));
+                }
+                let (prefix, tail) = kv_bytes.split_at_mut(v_range.start);
+                let k_plane = &mut prefix[k_range];
+                let v_plane = &mut tail[..v_range.len()];
+                pack_kv_batch_plane(slab.kv_dtype, slab.kv_dim, start_pos, k_batch, k_plane)?;
+                pack_kv_batch_plane(slab.kv_dtype, slab.kv_dim, start_pos, v_batch, v_plane)?;
+            }
+        }
+        Ok(end_pos)
+    }
+
+    /// Returns raw aligned K and V plane byte slices for `layer`.
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if `layer >= num_layers` or plane bounds fail.
+    pub fn layer_kv_bytes(&self, layer: usize) -> Result<(&[u8], &[u8]), KvError> {
+        match &self.backing {
+            WriterBacking::F32View(view) => {
+                let (k_plane, v_plane) = view
+                    .layer_kv(layer)
+                    .map_err(|err| KvError::InvalidDimensions(err.to_string()))?;
+                Ok((k_plane.as_bytes(), v_plane.as_bytes()))
+            }
+            WriterBacking::Bytes { kv_bytes, slab } => read_kv_bytes_planes(kv_bytes, *slab, layer),
+        }
+    }
+
+    /// Unpacks `[start_pos..end_pos)` rows from `layer` into caller-provided `k_out` and `v_out`
+    /// `f32` buffers without heap allocation, returning `(k_slice, v_slice)`.
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if bounds, `layer`, or output buffer capacities fail.
+    pub fn read_kv_range_f32<'o>(
+        &self,
+        layer: usize,
+        start_pos: usize,
+        end_pos: usize,
+        k_out: &'o mut [f32],
+        v_out: &'o mut [f32],
+    ) -> Result<(&'o [f32], &'o [f32]), KvError> {
+        let slab = self.slab();
+        let (_seq_len, _elem_len) = slab.validate_pos_range(start_pos, end_pos)?;
+        let (k_plane, v_plane) = self.layer_kv_bytes(layer)?;
+        unpack_kv_planes_range_f32(slab, k_plane, v_plane, start_pos..end_pos, k_out, v_out)
+    }
+
+    /// Unpacks the active window up to `end_pos` (respecting `sliding_window` when configured)
+    /// into caller-provided `k_out` and `v_out` buffers without heap allocation.
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if bounds, `layer`, or output buffer capacities fail.
+    pub fn read_valid_kv_range_f32<'o>(
+        &self,
+        layer: usize,
+        end_pos: usize,
+        k_out: &'o mut [f32],
+        v_out: &'o mut [f32],
+    ) -> Result<(&'o [f32], &'o [f32]), KvError> {
+        let start_pos = self.slab().valid_start_pos(end_pos);
+        self.read_kv_range_f32(layer, start_pos, end_pos, k_out, v_out)
+    }
+
+    /// Unpacks the currently committed valid range (`valid_kv_range(committed_tokens())`) into
+    /// caller-provided `k_out` and `v_out` buffers without heap allocation.
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if metadata, bounds, or output buffers fail.
+    pub fn read_committed_kv_range_f32<'o>(
+        &self,
+        layer: usize,
+        k_out: &'o mut [f32],
+        v_out: &'o mut [f32],
+    ) -> Result<(&'o [f32], &'o [f32]), KvError> {
+        let committed = self.committed_tokens()?;
+        self.read_valid_kv_range_f32(layer, committed, k_out, v_out)
+    }
+
+    /// Zero-allocation unpack of `[start_pos..end_pos)` into 128-byte aligned buffers allocated
+    /// from `scope`.
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if bounds fail or scratch capacity is exceeded.
+    pub fn read_kv_range_in_scratch<'s>(
+        &self,
+        layer: usize,
+        start_pos: usize,
+        end_pos: usize,
+        scope: &'s ScratchScope<'_>,
+    ) -> Result<(&'s [f32], &'s [f32]), KvError> {
+        let slab = self.slab();
+        let (k_plane, v_plane) = self.layer_kv_bytes(layer)?;
+        unpack_kv_planes_in_scratch(slab, k_plane, v_plane, start_pos, end_pos, scope)
+    }
+
+    /// Zero-allocation unpack of the currently committed valid KV window into 128-byte aligned
+    /// buffers allocated from `scope`.
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if metadata or bounds fail, or scratch capacity is exceeded.
+    pub fn read_committed_kv_range_in_scratch<'s>(
+        &self,
+        layer: usize,
+        scope: &'s ScratchScope<'_>,
+    ) -> Result<(&'s [f32], &'s [f32]), KvError> {
+        let committed = self.committed_tokens()?;
+        let start_pos = self.slab().valid_start_pos(committed);
+        self.read_kv_range_in_scratch(layer, start_pos, committed, scope)
+    }
+
+    /// Returns contiguous `0..end_pos` immutable `(k_prefix, v_prefix)` slices for `layer` (`F32` only).
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if `kv_dtype != F32`, `layer >= num_layers`, or
+    /// `end_pos > seq_capacity`.
     pub fn layer_kv_prefix(
         &self,
         layer: usize,
         end_pos: usize,
     ) -> Result<(&[f32], &[f32]), KvError> {
-        let seq_capacity = self.kv_view.seq_capacity();
-        if end_pos > seq_capacity {
-            return Err(KvError::InvalidDimensions(format!(
-                "end_pos ({end_pos}) exceeds seq_capacity ({seq_capacity})"
-            )));
+        let slab = self.slab();
+        match &self.backing {
+            WriterBacking::F32View(view) => {
+                let (_seq_len, elem_end) = slab.validate_pos_range(0, end_pos)?;
+                let (k_plane, v_plane) = view
+                    .layer_kv(layer)
+                    .map_err(|err| KvError::InvalidDimensions(err.to_string()))?;
+                Ok((&k_plane[..elem_end], &v_plane[..elem_end]))
+            }
+            WriterBacking::Bytes { kv_bytes, slab } => {
+                read_kv_f32_range(kv_bytes, *slab, layer, 0, end_pos)
+            }
         }
-        let kv_dim = self.kv_view.kv_dim();
-        let elem_end = end_pos
-            .checked_mul(kv_dim)
-            .ok_or_else(|| KvError::InvalidDimensions("elem_end overflowed usize".to_owned()))?;
-        let (k_plane, v_plane) = self
-            .kv_view
-            .layer_kv(layer)
-            .map_err(|err| KvError::InvalidDimensions(err.to_string()))?;
-        Ok((&k_plane[..elem_end], &v_plane[..elem_end]))
     }
 
     /// Returns immutable `(k_valid, v_valid)` slices for `layer` up to `end_pos` (respecting
-    /// `sliding_window` when configured).
+    /// `sliding_window` when configured, `F32` only).
     ///
     /// # Errors
-    /// Returns [`KvError::InvalidDimensions`] if `layer >= num_layers` or `end_pos > seq_capacity`.
+    /// Returns [`KvError::InvalidDimensions`] if `kv_dtype != F32`, `layer >= num_layers`, or
+    /// `end_pos > seq_capacity`.
     pub fn valid_kv_range(
         &self,
         layer: usize,
         end_pos: usize,
     ) -> Result<(&[f32], &[f32]), KvError> {
-        self.kv_view
-            .valid_kv_range(layer, end_pos)
-            .map_err(|err| KvError::InvalidDimensions(err.to_string()))
+        let slab = self.slab();
+        match &self.backing {
+            WriterBacking::F32View(view) => view
+                .valid_kv_range(layer, end_pos)
+                .map_err(|err| KvError::InvalidDimensions(err.to_string())),
+            WriterBacking::Bytes { kv_bytes, slab: s } => {
+                read_kv_f32_range(kv_bytes, *s, layer, slab.valid_start_pos(end_pos), end_pos)
+            }
+        }
     }
 
     /// Reads the `committed_token_count` for `block_idx` with `Acquire` ordering.
@@ -2104,7 +2726,7 @@ impl<'a> ArenaKvWriter<'a> {
         commit_token_span_in_meta(
             self.meta_bytes,
             self.logical_block_count,
-            self.kv_view.seq_capacity(),
+            self.seq_capacity(),
             start_pos,
             seq_len,
         )
@@ -2127,56 +2749,35 @@ impl<'a> ArenaKvWriter<'a> {
 /// Zero-copy read-only view over an initialized arena's KV cache slab and atomic [`KvBlockMeta`] table.
 #[derive(Debug)]
 pub struct ArenaKvReader<'a> {
-    kv_slab: &'a [f32],
+    kv_bytes: &'a [u8],
     meta_bytes: &'a [u8],
-    geometry: KvGeometry,
-    kv_dim: usize,
-    plane_len: usize,
+    slab: KvSlabGeometry,
     logical_block_count: usize,
 }
 
 impl<'a> ArenaKvReader<'a> {
     /// Wraps an initialized arena byte slice in a bounds-checked [`ArenaKvReader`].
     ///
+    /// Supports `F32`, `F16`, and `Q8_0` KV slabs aligned to [`VECTOR_PLANE_ALIGNMENT`].
+    ///
     /// # Errors
     /// Returns [`KvError::InvalidDimensions`] if header, KV slab, or metadata checks fail, or
     /// [`KvError::IpcError`] if metadata alignment is invalid for `AtomicU32` loads.
     pub fn from_arena_slice(arena_bytes: &'a [u8]) -> Result<Self, KvError> {
-        let slab = validate_arena_kv_slab(arena_bytes)?;
-        let (meta_offset, meta_end, logical_block_count) =
-            validate_arena_meta_bounds(arena_bytes, slab.geometry.seq_capacity, slab.kv_offset)?;
+        let validated = validate_arena_kv_slab(arena_bytes)?;
+        let (meta_offset, meta_end, logical_block_count) = validate_arena_meta_bounds(
+            arena_bytes,
+            validated.slab.geometry.seq_capacity,
+            validated.kv_offset,
+        )?;
         let meta_bytes = &arena_bytes[meta_offset..meta_end];
         validate_meta_slice_for_atomic(meta_bytes, logical_block_count)?;
-
-        let kv_bytes = &arena_bytes[slab.kv_offset..slab.kv_end];
-        let kv_slab = <[f32]>::ref_from_bytes(kv_bytes).map_err(|err| {
-            KvError::InvalidDimensions(format!("KV slab byte slice conversion failed: {err:?}"))
-        })?;
-        let kv_dim = slab
-            .geometry
-            .kv_dim()
-            .map_err(|err| KvError::InvalidDimensions(err.to_string()))?;
-        let plane_len = slab
-            .geometry
-            .plane_len()
-            .map_err(|err| KvError::InvalidDimensions(err.to_string()))?;
-        let required = slab
-            .geometry
-            .required_f32_len()
-            .map_err(|err| KvError::InvalidDimensions(err.to_string()))?;
-        if kv_slab.len() < required {
-            return Err(KvError::InvalidDimensions(format!(
-                "KV slab f32 length ({}) smaller than required ({required})",
-                kv_slab.len()
-            )));
-        }
+        let kv_bytes = &arena_bytes[validated.kv_offset..validated.kv_end];
 
         Ok(Self {
-            kv_slab: &kv_slab[..required],
+            kv_bytes,
             meta_bytes,
-            geometry: slab.geometry,
-            kv_dim,
-            plane_len,
+            slab: validated.slab,
             logical_block_count,
         })
     }
@@ -2192,31 +2793,49 @@ impl<'a> ArenaKvReader<'a> {
     /// Returns the validated [`KvGeometry`].
     #[must_use]
     pub const fn geometry(&self) -> KvGeometry {
-        self.geometry
+        self.slab.geometry
     }
 
     /// Returns the number of transformer KV layers.
     #[must_use]
     pub const fn num_layers(&self) -> usize {
-        self.geometry.num_layers
+        self.slab.geometry.num_layers
     }
 
     /// Returns the maximum sequence token capacity (`seq_capacity`).
     #[must_use]
     pub const fn seq_capacity(&self) -> usize {
-        self.geometry.seq_capacity
+        self.slab.geometry.seq_capacity
     }
 
     /// Returns the per-position vector width (`n_heads_kv * head_dim`).
     #[must_use]
     pub const fn kv_dim(&self) -> usize {
-        self.kv_dim
+        self.slab.kv_dim
     }
 
-    /// Returns the length of a single K or V plane (`seq_capacity * kv_dim`).
+    /// Returns the element encoding ([`KvDtype`]) of the underlying KV slab.
+    #[must_use]
+    pub const fn kv_dtype(&self) -> KvDtype {
+        self.slab.kv_dtype
+    }
+
+    /// Returns the encoded byte stride per token row (`KvDtype::row_bytes(kv_dim)`).
+    #[must_use]
+    pub const fn kv_row_bytes(&self) -> usize {
+        self.slab.kv_row_bytes
+    }
+
+    /// Returns the aligned byte stride between consecutive K/V planes.
+    #[must_use]
+    pub const fn kv_plane_stride_bytes(&self) -> usize {
+        self.slab.kv_plane_stride_bytes
+    }
+
+    /// Returns the semantic element length of a single K or V plane (`seq_capacity * kv_dim`).
     #[must_use]
     pub const fn plane_len(&self) -> usize {
-        self.plane_len
+        self.slab.plane_len()
     }
 
     /// Returns the number of 16-token blocks backing `seq_capacity`.
@@ -2225,65 +2844,128 @@ impl<'a> ArenaKvReader<'a> {
         self.logical_block_count
     }
 
-    /// Returns immutable `(k_plane, v_plane)` slices covering full `[0..seq_capacity)` for `layer`.
+    /// Returns raw aligned `(k_plane_bytes, v_plane_bytes)` slices for `layer`.
     ///
     /// # Errors
-    /// Returns [`KvError::InvalidDimensions`] if `layer >= num_layers()`.
-    pub fn layer_kv(&self, layer: usize) -> Result<(&'a [f32], &'a [f32]), KvError> {
-        if layer >= self.geometry.num_layers {
-            return Err(KvError::InvalidDimensions(format!(
-                "layer index {layer} out of bounds for num_layers={}",
-                self.geometry.num_layers
-            )));
-        }
-        let k_start = layer * 2 * self.plane_len;
-        let v_start = k_start + self.plane_len;
-        let layer_end = v_start + self.plane_len;
-        Ok((
-            &self.kv_slab[k_start..v_start],
-            &self.kv_slab[v_start..layer_end],
-        ))
+    /// Returns [`KvError::InvalidDimensions`] if `layer >= num_layers()` or plane bounds fail.
+    pub fn layer_kv_bytes(&self, layer: usize) -> Result<(&'a [u8], &'a [u8]), KvError> {
+        read_kv_bytes_planes(self.kv_bytes, self.slab, layer)
     }
 
-    /// Returns immutable `(k_slice, v_slice)` covering `[start_pos..end_pos)` for `layer`.
+    /// Unpacks `[start_pos..end_pos)` rows from `layer` into caller-provided `k_out` and `v_out`
+    /// `f32` buffers without heap allocation, returning `(k_slice, v_slice)`.
     ///
     /// # Errors
-    /// Returns [`KvError::InvalidDimensions`] if `layer >= num_layers()`, `start_pos > end_pos`,
-    /// or `end_pos > seq_capacity()`.
+    /// Returns [`KvError::InvalidDimensions`] if bounds, `layer`, or output buffer capacities fail.
+    pub fn read_kv_range_f32<'o>(
+        &self,
+        layer: usize,
+        start_pos: usize,
+        end_pos: usize,
+        k_out: &'o mut [f32],
+        v_out: &'o mut [f32],
+    ) -> Result<(&'o [f32], &'o [f32]), KvError> {
+        let (_seq_len, _elem_len) = self.slab.validate_pos_range(start_pos, end_pos)?;
+        let (k_plane, v_plane) = self.layer_kv_bytes(layer)?;
+        unpack_kv_planes_range_f32(
+            self.slab,
+            k_plane,
+            v_plane,
+            start_pos..end_pos,
+            k_out,
+            v_out,
+        )
+    }
+
+    /// Unpacks the active window up to `end_pos` (respecting `sliding_window` when configured)
+    /// into caller-provided `k_out` and `v_out` buffers without heap allocation.
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if bounds, `layer`, or output buffer capacities fail.
+    pub fn read_valid_kv_range_f32<'o>(
+        &self,
+        layer: usize,
+        end_pos: usize,
+        k_out: &'o mut [f32],
+        v_out: &'o mut [f32],
+    ) -> Result<(&'o [f32], &'o [f32]), KvError> {
+        let start_pos = self.slab.valid_start_pos(end_pos);
+        self.read_kv_range_f32(layer, start_pos, end_pos, k_out, v_out)
+    }
+
+    /// Unpacks the currently committed valid range (`valid_kv_range(committed_tokens())`) into
+    /// caller-provided `k_out` and `v_out` buffers without heap allocation.
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if metadata, bounds, or output buffers fail.
+    pub fn read_committed_kv_range_f32<'o>(
+        &self,
+        layer: usize,
+        k_out: &'o mut [f32],
+        v_out: &'o mut [f32],
+    ) -> Result<(&'o [f32], &'o [f32]), KvError> {
+        let committed = self.committed_tokens()?;
+        self.read_valid_kv_range_f32(layer, committed, k_out, v_out)
+    }
+
+    /// Zero-allocation unpack of `[start_pos..end_pos)` into 128-byte aligned buffers allocated
+    /// from `scope`.
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if bounds fail or scratch capacity is exceeded.
+    pub fn read_kv_range_in_scratch<'s>(
+        &self,
+        layer: usize,
+        start_pos: usize,
+        end_pos: usize,
+        scope: &'s ScratchScope<'_>,
+    ) -> Result<(&'s [f32], &'s [f32]), KvError> {
+        let (k_plane, v_plane) = self.layer_kv_bytes(layer)?;
+        unpack_kv_planes_in_scratch(self.slab, k_plane, v_plane, start_pos, end_pos, scope)
+    }
+
+    /// Zero-allocation unpack of the currently committed valid KV window into 128-byte aligned
+    /// buffers allocated from `scope`.
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if metadata or bounds fail, or scratch capacity is exceeded.
+    pub fn read_committed_kv_range_in_scratch<'s>(
+        &self,
+        layer: usize,
+        scope: &'s ScratchScope<'_>,
+    ) -> Result<(&'s [f32], &'s [f32]), KvError> {
+        let committed = self.committed_tokens()?;
+        let start_pos = self.slab.valid_start_pos(committed);
+        self.read_kv_range_in_scratch(layer, start_pos, committed, scope)
+    }
+
+    /// Returns immutable `(k_plane, v_plane)` slices covering full `[0..seq_capacity)` for `layer` (`F32` only).
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if `kv_dtype != F32` or `layer >= num_layers()`.
+    pub fn layer_kv(&self, layer: usize) -> Result<(&'a [f32], &'a [f32]), KvError> {
+        read_kv_f32_planes(self.kv_bytes, self.slab, layer)
+    }
+
+    /// Returns immutable `(k_slice, v_slice)` covering `[start_pos..end_pos)` for `layer` (`F32` only).
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if `kv_dtype != F32`, `layer >= num_layers()`,
+    /// `start_pos > end_pos`, or `end_pos > seq_capacity()`.
     pub fn layer_kv_range(
         &self,
         layer: usize,
         start_pos: usize,
         end_pos: usize,
     ) -> Result<(&'a [f32], &'a [f32]), KvError> {
-        if start_pos > end_pos {
-            return Err(KvError::InvalidDimensions(format!(
-                "start_pos ({start_pos}) > end_pos ({end_pos})"
-            )));
-        }
-        if end_pos > self.geometry.seq_capacity {
-            return Err(KvError::InvalidDimensions(format!(
-                "end_pos ({end_pos}) exceeds seq_capacity ({})",
-                self.geometry.seq_capacity
-            )));
-        }
-        let (k_plane, v_plane) = self.layer_kv(layer)?;
-        let elem_start = start_pos
-            .checked_mul(self.kv_dim)
-            .ok_or_else(|| KvError::InvalidDimensions("elem_start overflowed usize".to_owned()))?;
-        let elem_end = end_pos
-            .checked_mul(self.kv_dim)
-            .ok_or_else(|| KvError::InvalidDimensions("elem_end overflowed usize".to_owned()))?;
-        Ok((
-            &k_plane[elem_start..elem_end],
-            &v_plane[elem_start..elem_end],
-        ))
+        read_kv_f32_range(self.kv_bytes, self.slab, layer, start_pos, end_pos)
     }
 
-    /// Returns immutable `(k_prefix, v_prefix)` slices covering `0..end_pos` for `layer`.
+    /// Returns immutable `(k_prefix, v_prefix)` slices covering `0..end_pos` for `layer` (`F32` only).
     ///
     /// # Errors
-    /// Returns [`KvError::InvalidDimensions`] if `layer >= num_layers()` or `end_pos > seq_capacity()`.
+    /// Returns [`KvError::InvalidDimensions`] if `kv_dtype != F32`, `layer >= num_layers()`, or
+    /// `end_pos > seq_capacity()`.
     pub fn layer_kv_prefix(
         &self,
         layer: usize,
@@ -2293,26 +2975,25 @@ impl<'a> ArenaKvReader<'a> {
     }
 
     /// Returns immutable `(k_valid, v_valid)` slices up to `end_pos` (respecting `sliding_window`
-    /// when configured).
+    /// when configured, `F32` only).
     ///
     /// # Errors
-    /// Returns [`KvError::InvalidDimensions`] if `layer >= num_layers()` or `end_pos > seq_capacity()`.
+    /// Returns [`KvError::InvalidDimensions`] if `kv_dtype != F32`, `layer >= num_layers()`, or
+    /// `end_pos > seq_capacity()`.
     pub fn valid_kv_range(
         &self,
         layer: usize,
         end_pos: usize,
     ) -> Result<(&'a [f32], &'a [f32]), KvError> {
-        let start_pos = match self.geometry.sliding_window {
-            Some(window) => end_pos.saturating_sub(window),
-            None => 0,
-        };
+        let start_pos = self.slab.valid_start_pos(end_pos);
         self.layer_kv_range(layer, start_pos, end_pos)
     }
 
-    /// Reads the current committed watermark and returns `valid_kv_range(layer, committed_tokens)`.
+    /// Reads the current committed watermark and returns `valid_kv_range(layer, committed_tokens)` (`F32` only).
     ///
     /// # Errors
-    /// Returns [`KvError::InvalidDimensions`] if metadata is corrupt/non-contiguous or `layer >= num_layers()`.
+    /// Returns [`KvError::InvalidDimensions`] if metadata is corrupt/non-contiguous, `kv_dtype != F32`,
+    /// or `layer >= num_layers()`.
     pub fn committed_kv_range(&self, layer: usize) -> Result<(&'a [f32], &'a [f32]), KvError> {
         let committed = self.committed_tokens()?;
         self.valid_kv_range(layer, committed)
@@ -2342,21 +3023,35 @@ impl<'a> ArenaKvReader<'a> {
 ///
 /// # Errors
 /// Returns [`KvError::InvalidDimensions`] if header validation fails, geometry or dtype checks
-/// fail, or the exact KV slab range violates header region bounds or `f32` alignment.
+/// fail, planes have alignment padding, or the KV slab range violates header region bounds or `f32` alignment.
 pub fn kv_cache_view_from_arena_slice_mut(
     arena_bytes: &mut [u8],
 ) -> Result<KvCacheView<'_>, KvError> {
-    let slab = validate_arena_kv_slab(arena_bytes)?;
-    let kv_bytes = &mut arena_bytes[slab.kv_offset..slab.kv_end];
+    let validated = validate_arena_kv_slab(arena_bytes)?;
+    if validated.slab.kv_dtype != KvDtype::F32 {
+        return Err(KvError::InvalidDimensions(format!(
+            "KvCacheView requires F32 KV cache (kv_dtype=0), got {:?}",
+            validated.slab.kv_dtype
+        )));
+    }
+    if validated.slab.kv_plane_stride_bytes != validated.slab.raw_plane_bytes {
+        return Err(KvError::InvalidDimensions(format!(
+            "KvCacheView requires unpadded contiguous F32 planes (raw_plane_bytes={}, kv_plane_stride_bytes={})",
+            validated.slab.raw_plane_bytes, validated.slab.kv_plane_stride_bytes
+        )));
+    }
+    let kv_bytes = &mut arena_bytes[validated.kv_offset..validated.kv_end];
     let kv_f32s = <[f32]>::mut_from_bytes(kv_bytes).map_err(|err| {
         KvError::InvalidDimensions(format!("KV slab byte slice conversion failed: {err:?}"))
     })?;
-    KvCacheView::new(kv_f32s, slab.geometry)
+    KvCacheView::new(kv_f32s, validated.slab.geometry)
         .map_err(|err| KvError::InvalidDimensions(err.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
+    use jero_core::ipc::protocol::{KV_DTYPE_F16, KV_DTYPE_Q8_0};
+
     use super::*;
 
     #[test]
@@ -2977,7 +3672,7 @@ mod tests {
         let expected_q8_raw = 4 * 2 * 32 * (kv_dim / 32) * 34;
         assert_eq!(
             q8_layout.output_slabs_offset - q8_layout.kv_blocks_offset,
-            align_up_u64(expected_q8_raw, CACHELINE_ALIGNMENT as u64)
+            align_up_u64(expected_q8_raw, VECTOR_PLANE_ALIGNMENT as u64)
         );
     }
 
@@ -3073,17 +3768,17 @@ mod tests {
 
         // Verify fail-closed rejection on non-F32 KV dtype, multi-slot, and MLA flag.
         let (hdr_mut, _) = ArenaHeader::mut_from_prefix(arena_bytes).expect("mut header");
-        hdr_mut._reserved[4] = KV_DTYPE_F16;
+        hdr_mut.set_kv_dtype(KvDtype::F16);
         assert!(kv_cache_view_from_arena_slice_mut(arena_bytes).is_err());
 
         let (hdr_mut, _) = ArenaHeader::mut_from_prefix(arena_bytes).expect("mut header");
-        hdr_mut._reserved[4] = KV_DTYPE_F32;
+        hdr_mut.set_kv_dtype(KvDtype::F32);
         hdr_mut.active_slots = 2;
         assert!(kv_cache_view_from_arena_slice_mut(arena_bytes).is_err());
 
         let (hdr_mut, _) = ArenaHeader::mut_from_prefix(arena_bytes).expect("mut header");
         hdr_mut.active_slots = 1;
-        hdr_mut._reserved[5] = 1;
+        hdr_mut._reserved[ARENA_RESERVED_MLA_FLAG_OFFSET] = 1;
         assert!(kv_cache_view_from_arena_slice_mut(arena_bytes).is_err());
     }
 
@@ -3437,5 +4132,268 @@ mod tests {
         let (expected_k, expected_v) = make_batch_vectors(1, 0, 300, 8);
         assert_eq!(k_all, expected_k.as_slice());
         assert_eq!(v_all, expected_v.as_slice());
+    }
+
+    #[repr(C, align(128))]
+    #[derive(Clone, Copy, FromBytes, IntoBytes, zerocopy::Immutable)]
+    struct AlignedVectorLine([u8; VECTOR_PLANE_ALIGNMENT]);
+
+    fn init_aligned_slice_arena(cfg: &ArenaAllocationConfig) -> Vec<AlignedVectorLine> {
+        let layout = compute_arena_layout(cfg).expect("layout");
+        let total = usize::try_from(layout.total_bytes).expect("usize");
+        let lines = total.div_ceil(VECTOR_PLANE_ALIGNMENT);
+        let mut backing = vec![AlignedVectorLine([0_u8; VECTOR_PLANE_ALIGNMENT]); lines];
+        let arena_bytes = &mut backing.as_mut_bytes()[..total];
+        let (hdr_bytes, _) = arena_bytes.split_at_mut(size_of::<ArenaHeader>());
+        let hdr = ArenaHeader::mut_from_bytes(hdr_bytes).expect("hdr");
+        populate_arena_header(hdr, layout.total_bytes, cfg, &layout).expect("populate");
+        let meta_start = usize::try_from(layout.meta_table_offset).expect("meta");
+        for b in 0..layout.block_count as usize {
+            let off = meta_start + b * size_of::<KvBlockMeta>();
+            let m =
+                KvBlockMeta::mut_from_bytes(&mut arena_bytes[off..off + size_of::<KvBlockMeta>()])
+                    .expect("meta");
+            *m = KvBlockMeta::default();
+        }
+        backing
+    }
+
+    #[test]
+    fn test_vector_plane_128b_alignment_across_dtypes_and_hybrid_miri() {
+        let align = VECTOR_PLANE_ALIGNMENT as u64;
+        // Non-128B raw Q8_0 plane: 16 rows * 34 B = 544 B -> padded stride = 640 B.
+        for &(dtype, head_dim, expected_row, expected_stride) in &[
+            (KV_DTYPE_F32, 32_u32, 128_u64, 2048_u64),
+            (KV_DTYPE_F16, 16_u32, 32_u64, 512_u64),
+            (KV_DTYPE_Q8_0, 32_u32, 34_u64, 640_u64),
+        ] {
+            let cfg = ArenaAllocationConfig::new("align-check", 16, head_dim, 2)
+                .with_head_count_kv(1)
+                .with_vocab_size(64)
+                .with_kv_dtype(dtype);
+            let layout = compute_arena_layout(&cfg).expect("aligned layout");
+            assert_eq!(layout.token_slots_offset % align, 0);
+            assert_eq!(layout.kv_blocks_offset % align, 0);
+            assert_eq!(layout.output_slabs_offset % align, 0);
+            assert_eq!(layout.kv_row_bytes, expected_row);
+            assert_eq!(layout.kv_plane_stride_bytes, expected_stride);
+            assert_eq!(layout.kv_plane_stride_bytes % align, 0);
+            for layer in 0..2 {
+                assert_eq!(layout.k_plane_offset(layer) % align, 0);
+                assert_eq!(layout.v_plane_offset(layer) % align, 0);
+            }
+        }
+
+        // Hybrid sliding-window + global policies preserve 128-byte plane alignment.
+        let hybrid_cfg = ArenaAllocationConfig::new("hybrid-align", 32, 32, 2)
+            .with_head_count_kv(1)
+            .with_vocab_size(64)
+            .with_kv_dtype(KV_DTYPE_Q8_0)
+            .with_layer_policies(vec![
+                LayerKvPolicy::SlidingWindow { window_tokens: 16 },
+                LayerKvPolicy::GlobalFullContext,
+            ]);
+        let hybrid = compute_arena_layout(&hybrid_cfg).expect("hybrid layout");
+        assert_eq!(hybrid.kv_blocks_offset % align, 0);
+        assert_eq!(hybrid.output_slabs_offset % align, 0);
+        assert_eq!(
+            hybrid.output_slabs_offset - hybrid.kv_blocks_offset,
+            // Layer 0 (16 tok = 544 -> 640 * 2) + Layer 1 (32 tok = 1088 -> 1152 * 2)
+            (640 + 1152) * 2
+        );
+
+        // Runtime K/V plane pointers inside a 128B-aligned Q8_0 slab are 128B-aligned.
+        let q8_cfg = ArenaAllocationConfig::new("q8-ptr", 16, 32, 2)
+            .with_head_count_kv(1)
+            .with_vocab_size(32)
+            .with_kv_dtype(KV_DTYPE_Q8_0);
+        let mut backing = init_aligned_slice_arena(&q8_cfg);
+        let arena_bytes = backing.as_mut_bytes();
+        let reader = ArenaKvReader::from_arena_slice(arena_bytes).expect("Q8_0 reader");
+        assert_eq!(reader.kv_dtype(), KvDtype::Q8_0);
+        assert_eq!(reader.kv_row_bytes(), 34);
+        assert_eq!(reader.kv_plane_stride_bytes(), 640);
+        for layer in 0..2 {
+            let (k_plane, v_plane) = reader.layer_kv_bytes(layer).expect("layer bytes");
+            assert_eq!(k_plane.len(), 544);
+            assert_eq!(v_plane.len(), 544);
+            assert_eq!((k_plane.as_ptr() as usize) % VECTOR_PLANE_ALIGNMENT, 0);
+            assert_eq!((v_plane.as_ptr() as usize) % VECTOR_PLANE_ALIGNMENT, 0);
+        }
+    }
+
+    fn make_unit_batch(
+        layer: usize,
+        start_pos: usize,
+        seq_len: usize,
+        kv_dim: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut k = Vec::with_capacity(seq_len * kv_dim);
+        let mut v = Vec::with_capacity(seq_len * kv_dim);
+        for rel in 0..seq_len {
+            let pos = start_pos + rel;
+            for d in 0..kv_dim {
+                let bucket = u8::try_from((layer * 19 + pos * 11 + d * 5) % 64).expect("< 64");
+                let val = f32::from(bucket) / 31.5 - 1.0;
+                k.push(val * 0.9);
+                v.push(-val * 0.8 + 0.05);
+            }
+        }
+        (k, v)
+    }
+
+    #[test]
+    fn test_quantized_kv_writer_reader_and_scratch_roundtrip_miri() {
+        use jero_core::ScratchWorkspace;
+
+        for &(dtype, kv_dim, max_tol, min_cos) in &[
+            (KV_DTYPE_F16, 16_usize, 1e-3_f32, 0.999_99_f64),
+            (KV_DTYPE_Q8_0, 32_usize, 1.5e-2_f32, 0.999_f64),
+        ] {
+            let cfg =
+                ArenaAllocationConfig::new("quant-miri", 16, u32::try_from(kv_dim).unwrap(), 2)
+                    .with_head_count_kv(1)
+                    .with_vocab_size(32)
+                    .with_kv_dtype(dtype);
+            let layout = compute_arena_layout(&cfg).expect("layout");
+            let total = usize::try_from(layout.total_bytes).expect("usize");
+            let mut backing = init_aligned_slice_arena(&cfg);
+            let arena_bytes = &mut backing.as_mut_bytes()[..total];
+
+            {
+                let mut writer = ArenaKvWriter::from_arena_slice(arena_bytes).expect("writer");
+                assert!(writer.kv_cache_view().is_none());
+                assert_eq!(writer.kv_dtype(), KvDtype::from_u8(dtype).unwrap());
+                for layer in 0..2 {
+                    let (k0, v0) = make_unit_batch(layer, 0, 6, kv_dim);
+                    assert_eq!(
+                        writer
+                            .append_quantized_kv_batch(layer, 0, &k0, &v0)
+                            .expect("prefill"),
+                        6
+                    );
+                    let (k1, v1) = make_unit_batch(layer, 6, 4, kv_dim);
+                    assert_eq!(
+                        writer
+                            .append_quantized_kv_batch(layer, 6, &k1, &v1)
+                            .expect("decode"),
+                        10
+                    );
+                }
+                writer.commit_token_span(0, 6).expect("commit prefill");
+                writer.commit_token_span(6, 4).expect("commit decode");
+            }
+
+            let reader = ArenaKvReader::from_arena_slice(arena_bytes).expect("reader");
+            assert_eq!(reader.committed_tokens().expect("committed"), 10);
+            let mut scratch = ScratchWorkspace::new(32 * 1024).expect("scratch workspace");
+            let mut k_buf = vec![0.0_f32; 10 * kv_dim];
+            let mut v_buf = vec![0.0_f32; 10 * kv_dim];
+
+            for layer in 0..2 {
+                let (expected_k, expected_v) = make_unit_batch(layer, 0, 10, kv_dim);
+                let (rk, rv) = reader
+                    .read_committed_kv_range_f32(layer, &mut k_buf, &mut v_buf)
+                    .expect("read_committed_kv_range_f32");
+                let scope = scratch.scope();
+                let (sk, sv) = reader
+                    .read_committed_kv_range_in_scratch(layer, &scope)
+                    .expect("read_committed_kv_range_in_scratch");
+                assert_eq!((sk.as_ptr() as usize) % VECTOR_PLANE_ALIGNMENT, 0);
+                assert_eq!((sv.as_ptr() as usize) % VECTOR_PLANE_ALIGNMENT, 0);
+                assert_eq!(rk, sk);
+                assert_eq!(rv, sv);
+
+                let mut dot = 0.0_f64;
+                let mut n_a = 0.0_f64;
+                let mut n_b = 0.0_f64;
+                for (&exp, &got) in expected_k
+                    .iter()
+                    .chain(expected_v.iter())
+                    .zip(sk.iter().chain(sv.iter()))
+                {
+                    assert!(
+                        (exp - got).abs() <= max_tol,
+                        "dtype={dtype:?} diff {} > {max_tol}",
+                        (exp - got).abs()
+                    );
+                    dot += f64::from(exp) * f64::from(got);
+                    n_a += f64::from(exp) * f64::from(exp);
+                    n_b += f64::from(got) * f64::from(got);
+                }
+                let cosine = dot / (n_a.sqrt() * n_b.sqrt());
+                assert!(cosine >= min_cos, "cosine {cosine} < {min_cos}");
+            }
+        }
+
+        // Q8_0 requires kv_dim divisible by 32.
+        let bad_q8 = ArenaAllocationConfig::new("bad-q8", 16, 16, 1)
+            .with_head_count_kv(1)
+            .with_kv_dtype(KV_DTYPE_Q8_0);
+        assert!(matches!(
+            compute_arena_layout(&bad_q8),
+            Err(KvError::InvalidDimensions(_))
+        ));
+    }
+
+    #[test]
+    fn test_recurrent_memlock_o1_independence_miri() {
+        let cfg_short = ArenaAllocationConfig::new("ssm-o1", 64, 64, 0)
+            .with_vocab_size(64)
+            .with_recurrent_state(4, 128, 512);
+        let cfg_long = ArenaAllocationConfig::new("ssm-o1", 65_536, 64, 0)
+            .with_vocab_size(64)
+            .with_recurrent_state(4, 128, 512);
+
+        let est_short = cfg_short
+            .estimate_recurrent_state_bytes()
+            .expect("estimate recurrent short");
+        let layout_short = compute_arena_layout(&cfg_short).expect("layout short");
+        let layout_long = compute_arena_layout(&cfg_long).expect("layout long");
+
+        assert_eq!(est_short, layout_short.recurrent_total_bytes);
+        assert_eq!(
+            layout_short.recurrent_total_bytes,
+            layout_long.recurrent_total_bytes
+        );
+        assert_eq!(layout_short.total_bytes, layout_long.total_bytes);
+
+        let holder = KvHolder::with_memlock_ceiling(layout_short.total_bytes + 4096);
+        assert!(holder.available_lockable_bytes() >= layout_long.total_bytes);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_arena_handle_recurrent_ping_pong_roundtrip() {
+        let holder = KvHolder::new();
+        let cfg = ArenaAllocationConfig::new("mamba-handle", 65_536, 64, 0)
+            .with_vocab_size(128)
+            .with_recurrent_state(4, 128, 512);
+        let alloc = holder
+            .allocate(&cfg)
+            .expect("allocate O(1) recurrent arena");
+        let fd = holder.get_arena_fd(alloc.arena_id).expect("fd");
+        let len = usize::try_from(alloc.total_bytes).expect("usize");
+        let mut rw =
+            SharedMemoryArena::from_existing_fd(fd, len, "test_handle_rec", false).expect("rw");
+        let mut handle = ArenaHandle::new(&mut rw).expect("ArenaHandle");
+
+        let hdr0 = handle.recurrent_header().expect("recurrent_header");
+        assert_eq!(hdr0.num_recurrent_layers, 4);
+        assert_eq!(hdr0.committed_step, 0);
+
+        {
+            let (_h, active, inactive) = handle.recurrent_banks_mut().expect("banks");
+            assert!(active.iter().all(|&b| b == 0));
+            inactive.fill(0x5A);
+        }
+        let hdr1 = handle.commit_recurrent_step(1).expect("commit step 1");
+        assert_eq!(hdr1.committed_step, 1);
+        assert_eq!(handle.recurrent_header().expect("hdr1").committed_step, 1);
+
+        {
+            let (_h, active, _inactive) = handle.recurrent_banks_mut().expect("banks post-commit");
+            assert!(active.iter().all(|&b| b == 0x5A));
+        }
     }
 }

@@ -1,6 +1,7 @@
 //! Context memory holder daemon and shared memory arena management for the `SpacemiT` K3 AI platform.
 
-pub use jero_core::{DoryKvCacheMode, DoryLayerType, DoryMetadata};
+pub use jero_core::ipc::layout::estimate_recurrent_state_bytes;
+pub use jero_core::{DoryKvCacheMode, DoryLayerType, DoryMetadata, KvDtype};
 use jero_core::{K3Error, ModelMetadata};
 
 pub const KV_DAEMON_NAME: &str = "jero-kv-cache";
@@ -10,6 +11,7 @@ pub const CANONICAL_DORY_4B_PATTERN: &str =
     "S-S-S-*-S-S-S-*-S-S-S-*-S-S-S-*-S-S-S-*-S-S-S-*-S-S-S-*-S-S-S-*-S-S-S-*-";
 
 pub mod holder;
+pub mod quant_kv;
 pub mod server;
 
 pub use holder::{
@@ -19,6 +21,10 @@ pub use holder::{
     commit_recurrent_step_in_region, compute_arena_layout, compute_hybrid_kv_block_count,
     kv_cache_view_from_arena_slice_mut, read_recurrent_slot_header_from_region,
     recurrent_banks_from_region_mut, recurrent_banks_in_arena_mut, recurrent_region_offset,
+};
+pub use quant_kv::{
+    VECTOR_PLANE_ALIGNMENT, dequantize_q8_0_block, f16_to_f32, f32_to_f16, pack_kv_batch_plane,
+    pack_kv_row, quantize_q8_0_block, unpack_kv_range_plane, unpack_kv_row,
 };
 pub use server::{
     DEFAULT_SOCKET_PATH, KvServer, ServerConfig, SocketFileGuard, handle_connection,
